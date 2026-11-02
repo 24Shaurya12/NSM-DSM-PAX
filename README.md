@@ -56,6 +56,8 @@ make test q1    # same, sum query only (q1/Q1 = sum, q2/Q2 = projection)
 make graph      # latency vs k for all layouts, one graph per query (output/qN/)
 make graph q2   # same, projection only -> output/q2/graph_q2.png
 make graph q2 log  # same with a log y axis -> output/q2/graph_q2_log.png
+make test q2 perf  # also record hardware counters (core set); perf=mem / perf=stall for others
+make graph q2 perf # plus one graph per counter metric -> output/q2/graph_q2_<metric>.png
 ```
 
 `make test` runs the benchmark with only `k = 1` (low projectivity, p = 1/N)
@@ -78,6 +80,26 @@ first `make graph` creates a virtualenv in `.venv/` and installs
 `requirements.txt` into it.
 
 To add query 3, add `q3` to `QUERY_IDS` in the Makefile and set `QUERY_q3 := <name>`.
+
+### Hardware counters (`perf`)
+
+`--perf SET` (or `perf` / `perf=SET` with `make`) opens a group of hardware
+counters with `perf_event_open`. The counters run only around each timed `run()`,
+so data generation, setup and the correctness check are not counted. Raw counts
+are added to the CSV as extra columns after `result`. `summarize.py` and `plot.py`
+turn them into per-row metrics and derived ratios (IPC, L1D miss rate).
+
+| Set | Events | Question it answers |
+|-----|--------|---------------------|
+| `core` | cycles, instructions, L1D loads, L1D misses, dTLB misses | Is the scan limited by the CPU (high IPC) or by memory? How many cache lines/pages does it touch? |
+| `mem` (AMD Zen 3) | cycles; L1 fills for demand loads from L2 / L3 / DRAM; L1 fills by the hardware prefetcher from DRAM | Did the data arrive because the code asked for it (a stall) or because the prefetcher brought it in ahead of time? |
+| `stall` (AMD Zen 3) | cycles, instructions, dispatch stalls on a full load queue / store queue | Is the core waiting on loads or on stores? |
+
+Only user-space code is counted (`perf_event_paranoid=2` is enough). Each set
+has at most 5 events: under WSL2 only 5 of Zen 3's 6 counters are free, and a
+group that doesn't fit is never scheduled at all. The program exits with an
+error in that case instead of reporting zeros. `mem` and `stall` use raw AMD
+event codes and refuse to run on other CPUs.
 
 ## Flags
 

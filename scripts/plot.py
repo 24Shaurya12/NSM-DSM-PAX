@@ -3,7 +3,9 @@
 
 Usage: plot.py RESULTS.csv OUT_STEM [--logy]
 
-Writes OUT_STEM.png (latency). With --logy the file name gets a _log suffix.
+Writes OUT_STEM.png (latency). If the CSV has perf counter columns, also writes one
+OUT_STEM_<metric>.png per metric (e.g. _ipc, _l1d_misses_per_row). With --logy every
+file name gets a _log suffix.
 """
 import csv
 import statistics
@@ -16,6 +18,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter, LogLocator  # noqa: E402
 
+from perf_metrics import counter_columns, metrics  # noqa: E402
+
 # Fixed colour per layout so a layout looks the same in every graph.
 LAYOUT_COLORS = {"NSM": "#2a78d6", "DSM": "#eb6834", "PAX": "#1baf7a"}
 TEXT = "#0b0b0b"
@@ -26,14 +30,17 @@ SURFACE = "#fcfcfb"
 
 def load(path):
     """Returns ({series name: {(query, layout, k): [values]}}, meta).
-    The only series is "latency" (ms)."""
+    Series are "latency" (ms) plus one per perf metric if the CSV has counters."""
     series = defaultdict(lambda: defaultdict(list))
     meta = {}
     with open(path) as f:
         reader = csv.DictReader(f)
+        counters = counter_columns(reader.fieldnames or [])
         for row in reader:
             key = (row["query"], row["layout"], int(row["k"]))
             series["latency"][key].append(int(row["latency_ns"]) / 1e6)
+            for name, value in metrics(row, counters).items():
+                series[name][key].append(value)
             meta["rows"], meta["cols"] = int(row["rows"]), int(row["cols"])
             if int(row["page_size"]):
                 meta["page_size"] = int(row["page_size"])

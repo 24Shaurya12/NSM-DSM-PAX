@@ -14,6 +14,7 @@
 #include "layout.h"
 #include "nsm.h"
 #include "pax.h"
+#include "perf_counters.h"
 #include "queries/projection.h"
 #include "queries/sum.h"
 #include "query.h"
@@ -54,6 +55,7 @@ struct Options {
     std::vector<int> ks;  // empty -> 1, 2, 4, ..., cols
     std::vector<const QueryEntry*> queries;  // empty -> all
     std::string output;   // empty -> stdout
+    std::string perf_set;  // empty -> no hardware counters
 };
 
 [[noreturn]] void usage(const char* prog) {
@@ -66,7 +68,10 @@ struct Options {
               << "  --query Q1,Q2    queries to run (default: all of";
     for (const auto& q : kQueries) std::cerr << ' ' << q.name;
     std::cerr << ")\n"
-              << "  --output FILE    write CSV to FILE instead of stdout\n";
+              << "  --output FILE    write CSV to FILE instead of stdout\n"
+              << "  --perf SET       also record hardware counters per run; SET is one of";
+    for (const auto& s : PerfCounters::set_names()) std::cerr << ' ' << s;
+    std::cerr << "\n";
     std::exit(1);
 }
 
@@ -106,6 +111,7 @@ Options parse_args(int argc, char** argv) {
             }
         }
         else if (arg == "--output") o.output = val;
+        else if (arg == "--perf") o.perf_set = val;
         else usage(argv[0]);
     }
     if (o.rows == 0 || o.cols == 0) usage(argv[0]);
@@ -182,6 +188,16 @@ int main(int argc, char** argv) {
     std::cerr << "}\n";
 
     // --- Benchmark ---
+    std::unique_ptr<PerfCounters> counters;
+    if (!opt.perf_set.empty()) {
+        try {
+            counters = std::make_unique<PerfCounters>(opt.perf_set);
+        } catch (const std::exception& e) {
+            std::cerr << "error: " << e.what() << "\n";
+            return 1;
+        }
+    }
+
     std::ofstream file;
     if (!opt.output.empty()) {
         file.open(opt.output);
@@ -191,7 +207,10 @@ int main(int argc, char** argv) {
         }
     }
     std::ostream& out = opt.output.empty() ? std::cout : file;
-    out << "query,layout,rows,cols,k,page_size,iteration,latency_ns,result\n";
+    out << "query,layout,rows,cols,k,page_size,iteration,latency_ns,result";
+    if (counters)
+        for (const auto& name : counters->names()) out << ',' << name;
+    out << '\n';
 
     for (const QueryEntry* qe : opt.queries) {
         for (int k : opt.ks) {
@@ -207,19 +226,27 @@ int main(int argc, char** argv) {
                 }
 
                 for (int i = 0; i < kTimedIterations; ++i) {
+                    // Counters wrap the clock reads so their ioctls stay out of latency_ns.
+                    if (counters) counters->start();
                     auto start = std::chrono::steady_clock::now();
                     l->run(*q);
                     auto end = std::chrono::steady_clock::now();
+                    if (counters) counters->stop();
                     int64_t result = q->result();
                     g_sink = g_sink + result;
                     auto ns =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
                     out << q->name() << ',' << l->name() << ',' << opt.rows << ',' << opt.cols
                         << ',' << k << ',' << page_size << ',' << i << ',' << ns << ','
-                        << result << '\n';
+                        << result;
+                    if (counters)
+                        for (uint64_t v : counters->values()) out << ',' << v;
+                    out << '\n';
                 }
             }
         }
     }
+    if (counters && counters->multiplexed())
+        std::cerr << "warning: perf counters were multiplexed; counts are scaled estimates\n";
     return 0;
 }
