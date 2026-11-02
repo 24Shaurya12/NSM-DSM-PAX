@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include "query.h"
+
 PaxLayout::PaxLayout(const Table& t, std::size_t page_size)
     : rows_(t.rows),
       cols_(t.cols),
@@ -14,14 +16,14 @@ PaxLayout::PaxLayout(const Table& t, std::size_t page_size)
 
     std::size_t pages = (rows_ + tuples_per_page_ - 1) / tuples_per_page_;
     for (std::size_t p = 0; p < pages; ++p) {
-        std::size_t first = p * tuples_per_page_;
+        std::size_t first = page_first_row(p);
         std::size_t remaining = rows_ - first;
         page_tuple_counts_.push_back(remaining < tuples_per_page_ ? remaining : tuples_per_page_);
     }
 
     buffer_ = AlignedBuffer<int64_t>(pages * page_size_ / sizeof(int64_t));
     for (std::size_t p = 0; p < pages; ++p) {
-        std::size_t first = p * tuples_per_page_;
+        std::size_t first = page_first_row(p);
         for (std::size_t c = 0; c < cols_; ++c) {
             int64_t* mp = minipage(p, c);
             for (std::size_t i = 0; i < page_tuple_counts_[p]; ++i) mp[i] = t.at(first + i, c);
@@ -29,14 +31,4 @@ PaxLayout::PaxLayout(const Table& t, std::size_t page_size)
     }
 }
 
-int64_t PaxLayout::sum_first_k(int k) const {
-    int64_t sum = 0;
-    for (std::size_t p = 0; p < num_pages(); ++p) {
-        std::size_t n = page_tuple_counts_[p];
-        for (int c = 0; c < k; ++c) {
-            const int64_t* mp = minipage(p, c);
-            for (std::size_t i = 0; i < n; ++i) sum += mp[i];
-        }
-    }
-    return sum;
-}
+void PaxLayout::run(Query& q) const { q.run(*this); }

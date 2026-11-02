@@ -18,7 +18,7 @@ public:
         return columns_.size() * rows_ * sizeof(int64_t);
     }
 
-    int64_t sum_first_k(int k) const override;
+    void run(Query& q) const override;
 
     const int64_t* column(std::size_t c) const { return columns_[c].data(); }
 

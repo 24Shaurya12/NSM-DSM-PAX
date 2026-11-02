@@ -20,12 +20,13 @@ public:
     std::size_t cols() const override { return cols_; }
     std::size_t footprint_bytes() const override { return num_pages() * page_size_; }
 
-    int64_t sum_first_k(int k) const override;
+    void run(Query& q) const override;
 
     std::size_t page_size() const { return page_size_; }
     std::size_t tuples_per_page() const { return tuples_per_page_; }
     std::size_t num_pages() const { return page_tuple_counts_.size(); }
     std::size_t page_tuple_count(std::size_t p) const { return page_tuple_counts_[p]; }
+    std::size_t page_first_row(std::size_t p) const { return p * tuples_per_page_; }
 
     // Start of column c's minipage within page p.
     const int64_t* minipage(std::size_t p, std::size_t c) const {
