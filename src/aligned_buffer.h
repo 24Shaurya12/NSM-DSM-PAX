@@ -4,10 +4,19 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <emmintrin.h>
 #include <memory>
 #include <new>
 
 constexpr std::size_t kCacheLineSize = 64;
+
+// Evicts [p, p + bytes) from every cache level. The fence makes sure all flushes have finished
+// before the caller starts a timer.
+inline void flush_from_cache(const void* p, std::size_t bytes) {
+    const char* c = static_cast<const char*>(p);
+    for (std::size_t off = 0; off < bytes; off += kCacheLineSize) _mm_clflush(c + off);
+    _mm_mfence();
+}
 
 // Owning, zero-initialised, 64-byte aligned array of T.
 template <typename T>

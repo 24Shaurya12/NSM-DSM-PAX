@@ -9,6 +9,9 @@
 // Decomposition Storage Model: one contiguous array of `rows` values per column.
 class DsmLayout : public Layout {
 public:
+    // filter_sum works on batches of this many rows, so its selection vector stays in L1.
+    static constexpr std::size_t kBatchRows = 1024;
+
     explicit DsmLayout(const Table& t);
 
     std::string name() const override { return "DSM"; }
@@ -19,6 +22,10 @@ public:
     }
 
     int64_t sum_first_k(int k) const override;
+    QueryResult filter_sum(const Conjunction& where, int k) const override;
+    void flush_cache() const override {
+        for (const auto& col : columns_) flush_from_cache(col.data(), rows_ * sizeof(int64_t));
+    }
 
     const int64_t* column(std::size_t c) const { return columns_[c].data(); }
 

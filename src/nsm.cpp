@@ -14,3 +14,23 @@ int64_t NsmLayout::sum_first_k(int k) const {
     }
     return sum;
 }
+
+// Tuple at a time: test the predicates on the tuple's own fields, stopping at the first one that
+// fails, and add the first k fields of every qualifying tuple.
+QueryResult NsmLayout::filter_sum(const Conjunction& where, int k) const {
+    QueryResult res;
+    for (std::size_t r = 0; r < rows_; ++r) {
+        const int64_t* tuple = row(r);
+        bool qualifies = true;
+        for (const Predicate& p : where) {
+            if (!p.matches(tuple[p.col])) {
+                qualifies = false;
+                break;
+            }
+        }
+        if (!qualifies) continue;
+        ++res.count;
+        for (int c = 0; c < k; ++c) res.sum += tuple[c];
+    }
+    return res;
+}

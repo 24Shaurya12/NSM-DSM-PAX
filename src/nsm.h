@@ -15,6 +15,10 @@ public:
     std::size_t footprint_bytes() const override { return data_.size() * sizeof(int64_t); }
 
     int64_t sum_first_k(int k) const override;
+    QueryResult filter_sum(const Conjunction& where, int k) const override;
+    void flush_cache() const override {
+        flush_from_cache(data_.data(), data_.size() * sizeof(int64_t));
+    }
 
     const int64_t* row(std::size_t r) const { return data_.data() + r * cols_; }
 

@@ -21,6 +21,10 @@ public:
     std::size_t footprint_bytes() const override { return num_pages() * page_size_; }
 
     int64_t sum_first_k(int k) const override;
+    QueryResult filter_sum(const Conjunction& where, int k) const override;
+    void flush_cache() const override {
+        flush_from_cache(buffer_.data(), buffer_.size() * sizeof(int64_t));
+    }
 
     std::size_t page_size() const { return page_size_; }
     std::size_t tuples_per_page() const { return tuples_per_page_; }

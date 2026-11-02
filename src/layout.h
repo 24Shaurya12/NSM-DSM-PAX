@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+#include "predicate.h"
+
 // Common interface for all physical layouts so the benchmark driver is layout-agnostic.
 // New operators (predicated scans, tuple reconstruction, ...) are added here as further
 // virtual methods, implemented by each layout over its existing storage.
@@ -20,4 +22,10 @@ public:
 
     // SUM over all values of columns [0, k).
     virtual int64_t sum_first_k(int k) const = 0;
+
+    // COUNT(*) and SUM over columns [0, k) of the rows that satisfy every predicate in `where`.
+    virtual QueryResult filter_sum(const Conjunction& where, int k) const = 0;
+
+    // Evicts all of the table's data from the CPU caches (for cold-cache measurements).
+    virtual void flush_cache() const = 0;
 };

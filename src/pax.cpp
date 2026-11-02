@@ -40,3 +40,20 @@ int64_t PaxLayout::sum_first_k(int k) const {
     }
     return sum;
 }
+
+// Page at a time: evaluate the predicates on their minipages to get the qualifying positions in
+// the page, then read only those positions of the minipages of columns [0, k).
+QueryResult PaxLayout::filter_sum(const Conjunction& where, int k) const {
+    QueryResult res;
+    std::vector<uint32_t> sel(tuples_per_page_);
+    for (std::size_t p = 0; p < num_pages(); ++p) {
+        auto minipage_at = [&](int c) { return minipage(p, c); };
+        std::size_t m = select_positions(where, minipage_at, page_tuple_counts_[p], sel.data());
+        res.count += static_cast<int64_t>(m);
+        for (int c = 0; c < k; ++c) {
+            const int64_t* v = minipage(p, c);
+            for (std::size_t j = 0; j < m; ++j) res.sum += v[sel[j]];
+        }
+    }
+    return res;
+}
