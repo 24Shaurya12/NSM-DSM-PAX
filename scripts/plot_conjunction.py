@@ -233,7 +233,10 @@ def winners(summary, path):
 
 def main():
     out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "results/conjunction")
-    df = parse_queries(load(out_dir / "raw.csv"))
+    df = load(out_dir / "raw.csv")
+    if "op" in df:
+        df = df[df.op == "sum"]
+    df = parse_queries(df)
     plots = out_dir / "plots"
     plots.mkdir(parents=True, exist_ok=True)
 

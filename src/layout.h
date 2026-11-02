@@ -26,6 +26,11 @@ public:
     // COUNT(*) and SUM over columns [0, k) of the rows that satisfy every predicate in `where`.
     virtual QueryResult filter_sum(const Conjunction& where, int k) const = 0;
 
+    // Tuple reconstruction: SELECT c0, ..., c{k-1} FROM T WHERE `where`. Each qualifying row is
+    // written as a row-major tuple of its first k attributes into a TupleSink. Returns the number
+    // of tuples and the sink's checksum.
+    virtual QueryResult filter_materialize(const Conjunction& where, int k) const = 0;
+
     // Evicts all of the table's data from the CPU caches (for cold-cache measurements).
     virtual void flush_cache() const = 0;
 };

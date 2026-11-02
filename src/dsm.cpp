@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "tuple_sink.h"
+
 DsmLayout::DsmLayout(const Table& t) : rows_(t.rows) {
     columns_.reserve(t.cols);
     for (std::size_t c = 0; c < t.cols; ++c) {
@@ -36,4 +38,21 @@ QueryResult DsmLayout::filter_sum(const Conjunction& where, int k) const {
         }
     }
     return res;
+}
+
+// Same selection as filter_sum; then each qualifying tuple is stitched together by reading its
+// position from each of the k column arrays.
+QueryResult DsmLayout::filter_materialize(const Conjunction& where, int k) const {
+    TupleSink sink(k);
+    std::vector<uint32_t> sel(kBatchRows);
+    for (std::size_t start = 0; start < rows_; start += kBatchRows) {
+        std::size_t n = std::min(kBatchRows, rows_ - start);
+        auto column_at = [&](int c) { return column(c) + start; };
+        std::size_t m = select_positions(where, column_at, n, sel.data());
+        for (std::size_t j = 0; j < m; ++j) {
+            int64_t* out = sink.next();
+            for (int c = 0; c < k; ++c) out[c] = column_at(c)[sel[j]];
+        }
+    }
+    return sink.finish();
 }

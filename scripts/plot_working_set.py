@@ -85,8 +85,8 @@ def load(raw_csv):
     df = pd.read_csv(raw_csv)
     df["ns_per_row"] = df.latency_ns / df.rows
     df["useful_gbps"] = df.rows * df.k * 8 / df.latency_ns  # bytes per ns == GB/s
-    for c in ("llc_misses", "llc_refs", "l1d_misses", "branch_misses", "dram_read_bytes",
-              "dram_write_bytes"):
+    for c in ("llc_misses", "llc_refs", "l1d_misses", "dtlb_misses", "branch_misses",
+              "dram_read_bytes", "dram_write_bytes"):
         if c in df and df[c].notna().any():
             df[c + "_per_row"] = df[c] / df.rows
     if "instructions" in df and df.instructions.notna().any():
@@ -219,6 +219,8 @@ def main():
     df = load(out_dir / "raw.csv")
     if "predicate" in df:  # the working-set figures are about the unfiltered scan
         df = df[df.predicate == "none"]
+    if "op" in df:
+        df = df[df.op == "sum"]
     caches = read_caches(out_dir / "machine.txt")
     cols = int(df.cols.iloc[0])
     plots = out_dir / "plots"

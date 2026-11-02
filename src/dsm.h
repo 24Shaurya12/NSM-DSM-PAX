@@ -23,6 +23,7 @@ public:
 
     int64_t sum_first_k(int k) const override;
     QueryResult filter_sum(const Conjunction& where, int k) const override;
+    QueryResult filter_materialize(const Conjunction& where, int k) const override;
     void flush_cache() const override {
         for (const auto& col : columns_) flush_from_cache(col.data(), rows_ * sizeof(int64_t));
     }

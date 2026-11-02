@@ -117,6 +117,9 @@ PerfCounters::PerfCounters() {
         {"l1d_misses", PERF_TYPE_HW_CACHE,
          hw_cache(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ,
                   PERF_COUNT_HW_CACHE_RESULT_MISS)},
+        {"dtlb_misses", PERF_TYPE_HW_CACHE,
+         hw_cache(PERF_COUNT_HW_CACHE_DTLB, PERF_COUNT_HW_CACHE_OP_READ,
+                  PERF_COUNT_HW_CACHE_RESULT_MISS)},
     };
     for (const CoreSpec& s : core) {
         Event e;

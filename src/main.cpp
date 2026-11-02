@@ -35,9 +35,16 @@ struct Query {
     Conjunction where;
 };
 
-// Runs SELECT COUNT(*), SUM(c0 + ... + c{k-1}) FROM T WHERE q.where on one layout. Without
-// predicates this is the plain full scan.
-QueryResult run_query(const Layout& l, const Query& q, int k) {
+// What the query does with the qualifying rows.
+//   sum:         SELECT COUNT(*), SUM(c0 + ... + c{k-1}) FROM T WHERE ...
+//   materialize: SELECT c0, ..., c{k-1} FROM T WHERE ...   (tuple reconstruction)
+enum class Op { Sum, Materialize };
+
+const char* op_name(Op op) { return op == Op::Sum ? "sum" : "materialize"; }
+
+// Runs one query on one layout. A sum without predicates is the plain full scan.
+QueryResult run_query(const Layout& l, Op op, const Query& q, int k) {
+    if (op == Op::Materialize) return l.filter_materialize(q.where, k);
     if (q.where.empty()) return {static_cast<int64_t>(l.rows()), l.sum_first_k(k)};
     return l.filter_sum(q.where, k);
 }
@@ -49,6 +56,7 @@ struct Options {
     std::size_t page_size = 16 * 1024;
     std::vector<int> ks;  // empty -> 1, 2, 4, ..., cols
     std::vector<Query> queries;  // empty -> one query without predicates
+    std::vector<Op> ops = {Op::Sum};
     std::vector<std::string> layouts = {"nsm", "dsm", "pax"};
     std::vector<std::string> modes = {"warm"};
     int warmup = 2;
@@ -70,12 +78,17 @@ struct Options {
         << "                      PREDS is a comma-separated conjunction of terms:\n"
         << "                        c3=42 (equality), c0<10, c0<=10, c0>90, c0>=90,\n"
         << "                        c2=10..19 (inclusive range). Values are in [0, 100).\n"
+        << "                      PREDS = none means no predicate (full scan), which lets\n"
+        << "                      one run mix filtered and unfiltered queries.\n"
         << "                      Default: no predicate (full scan)\n"
+        << "  --op O1,O2          what to do with qualifying rows (default sum):\n"
+        << "                        sum:         SELECT COUNT(*), SUM(c0+...+c{k-1})\n"
+        << "                        materialize: SELECT c0,...,c{k-1} (tuple reconstruction)\n"
         << "  --layout L1,L2,...  layouts to build and run: nsm, dsm, pax (default all)\n"
         << "  --modes M1,M2       warm and/or cold (default warm). cold flushes the table\n"
         << "                      from all caches before every timed scan\n"
         << "  --warmup W          untimed scans before measuring each k (default 2)\n"
-        << "  --iterations I      timed samples per (layout, query, mode, k) (default 10)\n"
+        << "  --iterations I      timed samples per (layout, op, query, mode, k) (default 10)\n"
         << "  --min-sample-ms T   warm mode repeats the scan until a sample lasts >= T ms\n"
         << "                      (default 20)\n"
         << "  --output FILE       write CSV to FILE instead of stdout\n";
@@ -113,6 +126,7 @@ std::size_t parse_size(const std::string& s) {
 }
 
 Query parse_query(const std::string& text) {
+    if (text == "none") return {"none", {}};
     Query q;
     try {
         q.where = parse_conjunction(text);
@@ -139,6 +153,17 @@ Options parse_args(int argc, char** argv) {
         else if (arg == "--page-size") o.page_size = std::stoull(val);
         else if (arg == "--k") o.ks = parse_k_list(val);
         else if (arg == "--where") o.queries.push_back(parse_query(val));
+        else if (arg == "--op") {
+            o.ops.clear();
+            for (const std::string& name : split(val)) {
+                if (name == "sum") o.ops.push_back(Op::Sum);
+                else if (name == "materialize") o.ops.push_back(Op::Materialize);
+                else {
+                    std::cerr << "error: unknown op '" << name << "'\n";
+                    std::exit(1);
+                }
+            }
+        }
         else if (arg == "--layout") o.layouts = split(val);
         else if (arg == "--modes") o.modes = split(val);
         else if (arg == "--warmup") o.warmup = std::stoi(val);
@@ -207,8 +232,10 @@ int main(int argc, char** argv) {
     // --- Setup (untimed): generate data once, build the requested layouts from it, and
     // compute the expected sums. The logical table is freed before measuring. ---
     std::vector<std::unique_ptr<Layout>> layouts;
-    // expected[q][k] = reference result of query q summing columns [0, k)
+    // expected[q][k] = reference result of query q with op sum over columns [0, k);
+    // expected_mat[q][k] = the same for op materialize (count and the TupleSink checksum).
     std::vector<std::vector<QueryResult>> expected(opt.queries.size());
+    std::vector<std::vector<QueryResult>> expected_mat(opt.queries.size());
     try {
         Table table = generate_table(opt.rows, opt.cols, kSeed);
         for (const std::string& l : opt.layouts) {
@@ -228,8 +255,12 @@ int main(int argc, char** argv) {
                 for (std::size_t c = 0; c < table.cols; ++c) col_sum[c] += table.at(r, c);
             }
             expected[q].assign(opt.cols + 1, QueryResult{count, 0});
-            for (std::size_t c = 1; c <= opt.cols; ++c)
+            expected_mat[q].assign(opt.cols + 1, QueryResult{count, 0});
+            for (std::size_t c = 1; c <= opt.cols; ++c) {
                 expected[q][c].sum = expected[q][c - 1].sum + col_sum[c - 1];
+                expected_mat[q][c].sum = expected_mat[q][c - 1].sum +
+                                         static_cast<int64_t>(c) * col_sum[c - 1];
+            }
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
@@ -246,16 +277,20 @@ int main(int argc, char** argv) {
 
     // --- Correctness: every layout must match the results computed from the logical table. ---
     for (const auto& l : layouts) {
-        for (std::size_t q = 0; q < opt.queries.size(); ++q) {
-            for (int k : opt.ks) {
-                QueryResult got = run_query(*l, opt.queries[q], k);
-                const QueryResult& want = expected[q][k];
-                if (got != want) {
-                    std::cerr << "error: mismatch for where=" << opt.queries[q].label
-                              << " k=" << k << ": expected count=" << want.count
-                              << " sum=" << want.sum << ", " << l->name()
-                              << " returned count=" << got.count << " sum=" << got.sum << "\n";
-                    return 1;
+        for (Op op : opt.ops) {
+            for (std::size_t q = 0; q < opt.queries.size(); ++q) {
+                for (int k : opt.ks) {
+                    QueryResult got = run_query(*l, op, opt.queries[q], k);
+                    const QueryResult& want =
+                        op == Op::Sum ? expected[q][k] : expected_mat[q][k];
+                    if (got != want) {
+                        std::cerr << "error: mismatch for op=" << op_name(op)
+                                  << " where=" << opt.queries[q].label << " k=" << k
+                                  << ": expected count=" << want.count << " sum=" << want.sum
+                                  << ", " << l->name() << " returned count=" << got.count
+                                  << " sum=" << got.sum << "\n";
+                        return 1;
+                    }
                 }
             }
         }
@@ -284,7 +319,7 @@ int main(int argc, char** argv) {
         }
     }
     std::ostream& out = opt.output.empty() ? std::cout : file;
-    out << "layout,rows,cols,row_bytes,data_bytes,footprint_bytes,k,predicate,page_size,mode,"
+    out << "layout,rows,cols,row_bytes,data_bytes,footprint_bytes,k,op,predicate,page_size,mode,"
            "iteration,reps,latency_ns,matches,selectivity,result";
     for (std::size_t i = 0; i < perf.size(); ++i) out << ',' << perf.name(i);
     out << '\n';
@@ -294,49 +329,54 @@ int main(int argc, char** argv) {
     for (const auto& l : layouts) {
         // page_size is only meaningful for PAX; report 0 for the other layouts.
         std::size_t page_size = dynamic_cast<const PaxLayout*>(l.get()) ? opt.page_size : 0;
-        for (const Query& q : opt.queries) {
-            for (const std::string& mode : opt.modes) {
-                const bool cold = mode == "cold";
-                for (int k : opt.ks) {
-                    for (int i = 0; i < opt.warmup; ++i) g_sink = g_sink + run_query(*l, q, k).sum;
+        for (Op op : opt.ops) {
+            for (const Query& q : opt.queries) {
+                for (const std::string& mode : opt.modes) {
+                    const bool cold = mode == "cold";
+                    for (int k : opt.ks) {
+                        for (int i = 0; i < opt.warmup; ++i)
+                            g_sink = g_sink + run_query(*l, op, q, k).sum;
 
-                    // Warm: repeat the query so each sample is long enough to time precisely;
-                    // the data stays cached between repetitions if it fits. Cold: one query per
-                    // sample, right after flushing the table from every cache level.
-                    long reps = 1;
-                    if (!cold) {
-                        double t0 = now_ns();
-                        g_sink = g_sink + run_query(*l, q, k).sum;
-                        double one = std::max(now_ns() - t0, 1.0);
-                        reps = std::clamp(static_cast<long>(std::ceil(min_sample_ns / one)), 1L,
-                                          kMaxReps);
-                    }
-
-                    for (int it = 0; it < opt.iterations; ++it) {
-                        if (cold) l->flush_cache();
-                        QueryResult result;
-                        perf.start();
-                        double t0 = now_ns();
-                        for (long r = 0; r < reps; ++r) {
-                            result = run_query(*l, q, k);
-                            g_sink = g_sink + result.sum;
+                        // Warm: repeat the query so each sample is long enough to time
+                        // precisely; the data stays cached between repetitions if it fits.
+                        // Cold: one query per sample, right after flushing the table from every
+                        // cache level.
+                        long reps = 1;
+                        if (!cold) {
+                            double t0 = now_ns();
+                            g_sink = g_sink + run_query(*l, op, q, k).sum;
+                            double one = std::max(now_ns() - t0, 1.0);
+                            reps = std::clamp(static_cast<long>(std::ceil(min_sample_ns / one)),
+                                              1L, kMaxReps);
                         }
-                        double elapsed = now_ns() - t0;
-                        perf.stop();
 
-                        // Latency and counters are reported per query.
-                        out << l->name() << ',' << opt.rows << ',' << opt.cols << ',' << row_bytes
-                            << ',' << data_bytes << ',' << l->footprint_bytes() << ',' << k << ','
-                            << q.label << ',' << page_size << ',' << mode << ',' << it << ','
-                            << reps << ',' << elapsed / reps << ',' << result.count << ','
-                            << std::setprecision(6)
-                            << static_cast<double>(result.count) / opt.rows
-                            << std::setprecision(1) << ',' << result.sum;
-                        for (std::size_t i = 0; i < perf.size(); ++i) {
-                            out << ',';
-                            if (perf.available(i)) out << perf.value(i) / reps;
+                        for (int it = 0; it < opt.iterations; ++it) {
+                            if (cold) l->flush_cache();
+                            QueryResult result;
+                            perf.start();
+                            double t0 = now_ns();
+                            for (long r = 0; r < reps; ++r) {
+                                result = run_query(*l, op, q, k);
+                                g_sink = g_sink + result.sum;
+                            }
+                            double elapsed = now_ns() - t0;
+                            perf.stop();
+
+                            // Latency and counters are reported per query.
+                            out << l->name() << ',' << opt.rows << ',' << opt.cols << ','
+                                << row_bytes << ',' << data_bytes << ',' << l->footprint_bytes()
+                                << ',' << k << ',' << op_name(op) << ',' << q.label << ','
+                                << page_size << ',' << mode << ',' << it << ',' << reps << ','
+                                << elapsed / reps << ',' << result.count << ','
+                                << std::setprecision(6)
+                                << static_cast<double>(result.count) / opt.rows
+                                << std::setprecision(1) << ',' << result.sum;
+                            for (std::size_t i = 0; i < perf.size(); ++i) {
+                                out << ',';
+                                if (perf.available(i)) out << perf.value(i) / reps;
+                            }
+                            out << '\n';
                         }
-                        out << '\n';
                     }
                 }
             }

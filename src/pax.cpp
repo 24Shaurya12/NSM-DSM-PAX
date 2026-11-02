@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include "tuple_sink.h"
+
 PaxLayout::PaxLayout(const Table& t, std::size_t page_size)
     : rows_(t.rows),
       cols_(t.cols),
@@ -56,4 +58,20 @@ QueryResult PaxLayout::filter_sum(const Conjunction& where, int k) const {
         }
     }
     return res;
+}
+
+// Same selection as filter_sum; then each qualifying tuple is stitched together from the k
+// minipages of its page.
+QueryResult PaxLayout::filter_materialize(const Conjunction& where, int k) const {
+    TupleSink sink(k);
+    std::vector<uint32_t> sel(tuples_per_page_);
+    for (std::size_t p = 0; p < num_pages(); ++p) {
+        auto minipage_at = [&](int c) { return minipage(p, c); };
+        std::size_t m = select_positions(where, minipage_at, page_tuple_counts_[p], sel.data());
+        for (std::size_t j = 0; j < m; ++j) {
+            int64_t* out = sink.next();
+            for (int c = 0; c < k; ++c) out[c] = minipage_at(c)[sel[j]];
+        }
+    }
+    return sink.finish();
 }

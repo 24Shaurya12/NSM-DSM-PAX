@@ -87,6 +87,8 @@ def has(summary, metric):
 def main():
     out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "results/selectivity")
     df = load(out_dir / "raw.csv")
+    if "op" in df:
+        df = df[df.op == "sum"]
     plots = out_dir / "plots"
     plots.mkdir(parents=True, exist_ok=True)
 

@@ -1,1 +1,4 @@
 50% selectivity is the worst
+
+for very low selectivity dsm is orders of magnitude better
+than nsm

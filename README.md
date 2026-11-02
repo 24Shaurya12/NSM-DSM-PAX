@@ -1,13 +1,15 @@
 # NSM / DSM / PAX scan benchmark
 
 A small in-memory benchmark that compares three physical layouts of the same
-`int64_t` table on the query
+`int64_t` table on two kinds of query:
 
 ```sql
-SELECT COUNT(*), SUM(c0 + ... + c{k-1}) FROM T [WHERE p1 AND p2 AND ...]
+SELECT COUNT(*), SUM(c0 + ... + c{k-1}) FROM T [WHERE p1 AND p2 AND ...]   -- --op sum
+SELECT c0, ..., c{k-1}                  FROM T [WHERE p1 AND p2 AND ...]   -- --op materialize
 ```
 
-where each `p` is an equality or range predicate on any column.
+where each `p` is an equality or range predicate on any column. `materialize`
+reconstructs the qualifying tuples (row-major) and hands them to a consumer.
 
 | Layout | Storage |
 |--------|---------|
@@ -25,6 +27,7 @@ src/aligned_buffer.h   64-byte aligned owning array
 src/table.{h,cpp}      logical table + reproducible data generation
 src/layout.h           common Layout interface (sum_first_k, filter_sum, ...)
 src/predicate.{h,cpp}  predicates, --where parsing, selection-vector evaluation
+src/tuple_sink.h       consumer for reconstructed tuples (--op materialize)
 src/nsm.{h,cpp}        NSM layout
 src/dsm.{h,cpp}        DSM layout
 src/pax.{h,cpp}        PAX layout
@@ -37,6 +40,10 @@ scripts/run_selectivity.sh   single-predicate selectivity sweep
 scripts/plot_selectivity.py  figures + summary tables for that sweep
 scripts/run_conjunction.sh   two-predicate (selective + unselective) sweep, both orders
 scripts/plot_conjunction.py  figures + summary tables for that sweep
+scripts/run_pagesize.sh      PAX page-size sweep over the scan, filter and reconstruction queries
+scripts/plot_pagesize.py     figures + summary tables for that sweep
+scripts/run_pax_wins.sh      wide-table SELECT * at low selectivity (where PAX wins)
+scripts/plot_pax_wins.py     figures + summary tables for that sweep
 ```
 
 To add a new operator (such as a predicated scan or tuple reconstruction), add
@@ -58,7 +65,8 @@ make clean
 | `--cols N` | 16 | number of `int64_t` columns |
 | `--page-size B` | 16384 | PAX page size in bytes (must be a multiple of 64 and hold at least one tuple) |
 | `--k K1,K2,...` | `1,2,4,...,N` | values of `k` to benchmark (`N` is always included in the default) |
-| `--where PREDS` | none | filter rows (see below); repeat the flag to run several queries in one process |
+| `--where PREDS` | none | filter rows (see below); repeat the flag to run several queries in one process. `--where none` is the unfiltered query, so one run can mix both |
+| `--op O,...` | `sum` | `sum` and/or `materialize` (tuple reconstruction of columns `0..k-1`) |
 | `--layout L,...` | `nsm,dsm,pax` | which layouts to build and run |
 | `--modes M,...` | `warm` | `warm` and/or `cold` (cold flushes the table from every cache level with `clflush` before each timed scan) |
 | `--warmup W` | 2 | untimed scans before measuring each `k` |
@@ -89,7 +97,22 @@ a filtered query:
 | DSM | Batches of 1024 rows. The first predicate scans its column and writes the qualifying positions to a selection vector; each further predicate re-checks only those positions; then columns `0..k-1` are read only at the selected positions. |
 | PAX | The same selection-vector algorithm, one page at a time, over the page's minipages. |
 
-Without `--where`, every layout runs the plain full scan (`sum_first_k`).
+Without `--where` (or with `--where none`), `sum` runs the plain full scan
+(`sum_first_k`).
+
+## Tuple reconstruction (`--op materialize`)
+
+Each qualifying row is written as a row-major tuple of its first `k`
+attributes into a 1024-tuple output buffer (`TupleSink`). When the buffer is
+full it is consumed (folded into a checksum that weights attribute `c` by
+`c + 1`, so a value in the wrong attribute fails the correctness check) and
+reused, so the output stays in cache and costs every layout the same.
+
+| Layout | How a qualifying tuple is gathered |
+|--------|------------------------------------|
+| NSM | one `memcpy` of the row's first `k` values |
+| DSM | after the selection vector, one value from each of the `k` column arrays |
+| PAX | after the per-page selection vector, one value from each of the page's `k` minipages |
 
 ## What a run does
 
@@ -112,9 +135,9 @@ It writes one CSV row per timed sample. Latency and counters are **per scan**
 (the sample total divided by `reps`):
 
 ```
-layout,rows,cols,row_bytes,data_bytes,footprint_bytes,k,predicate,page_size,mode,iteration,reps,
+layout,rows,cols,row_bytes,data_bytes,footprint_bytes,k,op,predicate,page_size,mode,iteration,reps,
 latency_ns,matches,selectivity,result,
-cycles,instructions,branch_misses,llc_refs,llc_misses,l1d_misses,dram_read_bytes,dram_write_bytes
+cycles,instructions,branch_misses,llc_refs,llc_misses,l1d_misses,dtlb_misses,dram_read_bytes,dram_write_bytes
 ```
 
 `predicate` is the `--where` text with `,` shown as ` & ` (`none` without a
@@ -125,7 +148,7 @@ pages. Counter fields are empty when the counter is unavailable.
 ## Hardware counters
 
 Core counters (`cycles`, `instructions`, `branch_misses`, `llc_refs`,
-`llc_misses`, `l1d_misses`) count only this process in user space. On hybrid Intel CPUs they
+`llc_misses`, `l1d_misses`, `dtlb_misses`) count only this process in user space. On hybrid Intel CPUs they
 are opened on the P-core PMU, so **pin the benchmark to a P-core**
 (`taskset -c 2 ...`). `dram_read_bytes`/`dram_write_bytes` come from the
 memory controller's free-running uncore counters and are **system-wide**.
@@ -200,6 +223,34 @@ for S1 in {0,1,2,5,10,20,50,100}. The 1 GB default keeps even one DSM column
 (64 MB) out of the LLC. Figures: `conj_latency.png`, `conj_relative_to_dsm.png`,
 `conj_order_penalty.png` (selective-last ÷ selective-first) and
 `conj_counters.png` (comparisons, branch misses and DRAM bytes per row).
+
+## PAX page-size experiment
+
+```
+scripts/run_pagesize.sh                    # 1G table, 16 cols, pages 1K..16M
+python3 scripts/plot_pagesize.py           # figures + tables in results/pagesize/
+```
+
+Runs the scan, single-filter (`c0<1`, `c0<10`, `c0<50`) and two-predicate
+(`c0<1 AND c12<50`) queries, each as `sum` and `materialize`, for k in
+{1,4,16}. PAX runs once per page size (1 KB to 16 MB, so 8 to 131072 tuples per
+page and 64 B to 1 MB minipages); NSM and DSM run once as reference lines.
+Outputs `pagesize_sum.png`, `pagesize_materialize.png`, `pagesize_counters.png`
+and `best_page_size.md`.
+
+## PAX-wins experiment
+
+```
+scripts/run_pax_wins.sh                    # 1G table, 64 cols
+python3 scripts/plot_pax_wins.py           # figures + tables in results/pax_wins/
+```
+
+`SELECT * FROM T WHERE c0 < S` on a 64-column table for selectivities from
+0.5% to 10%, with PAX pages from 4 KB to 1 MB. The predicate needs only `c0`
+(bad for NSM, which touches every row), and each qualifying tuple needs all 64
+attributes (bad for DSM, which fetches them from 64 separate arrays; PAX finds
+them in one page). Outputs `pax_wins_latency.png`, `pax_wins_counters.png` and
+`winners.md`.
 
 ## Example
 
