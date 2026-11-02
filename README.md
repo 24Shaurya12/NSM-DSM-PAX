@@ -51,7 +51,33 @@ The Makefile picks up the new file automatically.
 ```
 make            # builds build/scan_bench with -std=c++17 -O2 -march=native
 make clean
+make test       # quick run at low and high projectivity, printed as a table
+make test q1    # same, sum query only (q1/Q1 = sum, q2/Q2 = projection)
+make graph      # latency vs k for all layouts, one graph per query (output/qN/)
+make graph q2   # same, projection only -> output/q2/graph_q2.png
+make graph q2 log  # same with a log y axis -> output/q2/graph_q2_log.png
 ```
+
+`make test` runs the benchmark with only `k = 1` (low projectivity, p = 1/N)
+and `k = N` (high projectivity, p = 1), for every query. It pipes the CSV
+through `scripts/summarize.py`, which prints the median, min and max latency
+and the input read bandwidth (GB/s) for each query, k and layout. To change the table size, use
+`make test TEST_ROWS=4000000 TEST_COLS=32`. The script also works on any
+benchmark output, e.g. `./build/scan_bench | python3 scripts/summarize.py`.
+
+Query ids: `q1` = sum, `q2` = projection. The ids and `log` are case-insensitive.
+
+`make graph` runs every k (1, 2, 4, ..., N) for each selected query. For query
+`qN` it writes the raw results to `output/qN/graph_qN.csv` and the plot to
+`output/qN/graph_qN.png`. The plot shows median latency vs k for each layout,
+with a shaded min–max band. The x axis is log₂ because k doubles each step. The
+y axis is linear by default; adding `log` switches it to a log scale and saves the
+plot as `graph_qN_log.png`, so it doesn't overwrite the linear one. The graphs use
+the same `TEST_ROWS` / `TEST_COLS` as `make test`. Plotting needs matplotlib: the
+first `make graph` creates a virtualenv in `.venv/` and installs
+`requirements.txt` into it.
+
+To add query 3, add `q3` to `QUERY_IDS` in the Makefile and set `QUERY_q3 := <name>`.
 
 ## Flags
 
