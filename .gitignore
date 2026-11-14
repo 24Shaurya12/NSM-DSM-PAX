@@ -2,3 +2,7 @@
 build/
 output/
 __pycache__/
+build-dev/
+results_quick/
+*.csv.tmp
+report/
