@@ -6,6 +6,7 @@
 class NsmLayout;
 class DsmLayout;
 class PaxLayout;
+class EncodedDsmLayout;
 
 // A query has one run() overload per layout, so all of a query's layout-specific code
 // lives together in its own file under src/queries/. Layouts only expose their storage.
@@ -21,6 +22,7 @@ public:
     virtual void run(const NsmLayout& t) = 0;
     virtual void run(const DsmLayout& t) = 0;
     virtual void run(const PaxLayout& t) = 0;
+    virtual void run(const EncodedDsmLayout& t) = 0;
 
     // Value summarising the last run's output; must be identical across layouts.
     // Called outside the timed region.

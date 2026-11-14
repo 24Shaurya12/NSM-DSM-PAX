@@ -14,8 +14,11 @@ A small in-memory benchmark that compares three physical layouts of the same
 | DSM | `N` separate arrays of `R` values, one per column. |
 | PAX | Fixed-size pages, each holding `floor(page_size / (N*8))` tuples. Inside a page, every column has its own contiguous minipage. The tuple count is stored per page, since the last page may be partial. |
 
-All buffers are 64-byte aligned. Data is uniform in `[0, 100)` from
+DSM can also be run with every column compressed (see [Encodings](#encodings-dsm-only)).
+
+All buffers are 64-byte aligned. By default, data is uniform in `[0, 100)` from
 `std::mt19937_64` with a fixed seed (42), so every run produces the same table.
+`--dist` picks another distribution.
 
 ## Layout of the code
 
@@ -26,6 +29,10 @@ src/layout.h           common Layout interface (storage only, plus run(Query&))
 src/nsm.{h,cpp}        NSM layout
 src/dsm.{h,cpp}        DSM layout
 src/pax.{h,cpp}        PAX layout
+src/encoded_dsm.{h,cpp}  DSM with encoded columns, read in value or vector mode
+src/encodings/encoded_column.*  EncodedColumn / ColumnCursor interfaces + encoding registry
+src/encodings/bits.*   bit-packing helpers (pack, extract one value, unrolled unpack)
+src/encodings/<name>.cpp  one encoding each: plain bitpack for dict rle delta
 src/query.h            Query interface: one run() overload per layout, plus result()
 src/queries/sum.*      SUM query
 src/queries/projection.*  projection query
@@ -101,6 +108,77 @@ group that doesn't fit is never scheduled at all. The program exits with an
 error in that case instead of reporting zeros. `mem` and `stall` use raw AMD
 event codes and refuse to run on other CPUs.
 
+## Encodings (DSM only)
+
+`--encoding` adds DSM layouts whose columns are each stored in one encoding.
+Only the column store gets encodings: NSM and PAX stay uncompressed as reference
+points. Each encoding is run in two scan modes, so `--encoding dict` adds two
+layouts, `DSM-dict-value` and `DSM-dict-vector`. Both share one encoded copy of
+the data.
+
+| Encoding | Storage | Compresses well when |
+|----------|---------|----------------------|
+| `plain` | The `int64` array, same as DSM | Never. Measures the cost of the scan machinery alone, with no decoding. |
+| `bitpack` | `v - min(column)` in `w` bits, where `w` covers the whole column's range | The whole column has a narrow range |
+| `for` | Frame of reference: like `bitpack`, but each block of 1024 values has its own min and width | Each block has a narrow range (e.g. sorted data) |
+| `dict` | Sorted distinct values + a bit-packed code per row | There are few distinct values, however large or spread out |
+| `rle` | One (value, run end) pair per run of equal values | Values repeat in long runs |
+| `delta` | Per block of 1024: the first value + zigzag-encoded, bit-packed differences between neighbours | Neighbouring values are close (e.g. sorted data) |
+
+| Mode | How a query reads a column |
+|------|----------------------------|
+| `value` | One virtual `ColumnCursor::next()` call per value, like a tuple-at-a-time (Volcano) operator that doesn't know the encoding at compile time. |
+| `vector` | One virtual `EncodedColumn::decode()` call per 1024 values into a buffer, then a tight loop over the buffer. Bit-unpacking uses a kernel unrolled for each width from 0 to 64. |
+
+Each query implements both modes in its own file. `projection` in vector mode
+decodes one column's batch and scatters it into that column of the batch's
+output rows. The CSV's `footprint_bytes` column, and `size_MB` / `ratio` in
+`make test`, report the compressed size.
+
+To make the encodings meaningful, `--dist` generates each column independently:
+
+| `--dist` | Data | Favours |
+|----------|------|---------|
+| `uniform` (default) | uniform in `[0, 100)`; 7 bits | `bitpack`, `for`, `dict` |
+| `wide` | uniform over all of `int64` | nothing; shows what each encoding costs when it can't compress |
+| `sorted` | increasing; each value = previous + uniform `[0, 8)` | `delta`, then `for` |
+| `runs` | runs of one value in `[0, 2^20)`, lengths uniform in `[1, 2L-1]` (`--run-length L`, default 64) | `rle` |
+| `zipf` | Zipf (s = 1) over 10,000 distinct values, each a full-range `int64` | `dict` |
+
+`sum` accumulates modulo 2^64 (unsigned), so `wide` and `zipf` data can't
+overflow it.
+
+```
+make test q1 enc=all                # every encoding, both modes, plus uncompressed DSM
+make test q1 enc=dict,rle dist=runs
+make graph q1 enc=all dist=sorted   # -> output/q1/graph_q1_enc_sorted.png
+make graph q2 enc=all mode=vector   # vector mode only
+make test enc=all layout=nsm,dsm,pax  # also include NSM and PAX
+```
+
+`make encodings` runs everything at once. For each selected query and each
+distribution, it runs uncompressed DSM plus every encoding over every k and
+draws `output/qN/graph_qN_enc_<dist>.png`. It then summarises the runs in
+`output/qN/encodings_qN.png` and the encoded sizes in `output/qN/encodings_qN_size.png`
+(with the exact numbers in `encodings_qN.csv`), at
+k = N: the compression ratio, and the speedup over uncompressed DSM in each scan
+mode, per distribution and encoding. Bars above 1× mean better than
+uncompressed DSM.
+
+```
+make encodings TEST_ROWS=1000000 TEST_COLS=16   # both queries, ~3 minutes
+make encodings q1 mode=vector
+```
+
+Memory: every encoding keeps its own copy of the table. With the default
+100K × 512 table (390 MB) and `wide` data, that's about 3.6 GB in total, so on a
+machine with little RAM use fewer rows or columns.
+
+With `enc=`, `make` runs only uncompressed DSM as the baseline unless you pass
+`layout=`. In graphs, colour marks the encoding and line style the mode
+(solid = vector, dashed = value). With more than four series, the min–max bands
+are left out.
+
 ## Flags
 
 | Flag | Default | Meaning |
@@ -111,10 +189,17 @@ event codes and refuse to run on other CPUs.
 | `--k K1,K2,...` | `1,2,4,...,N` | values of `k` (number of leading columns each query reads); `N` is always included in the default |
 | `--query Q1,Q2` | all | queries to run (`sum`, `projection`) |
 | `--output FILE` | stdout | where to write the CSV |
+| `--perf SET` | none | also record hardware counters (`core`, `mem`, `stall`) |
+| `--dist D` | `uniform` | data distribution: `uniform`, `wide`, `sorted`, `runs`, `zipf` |
+| `--run-length L` | 64 | mean run length for `--dist runs` |
+| `--layout L1,L2` | all | uncompressed layouts to run: `nsm`, `dsm`, `pax`, or `none` |
+| `--encoding E1,E2` | none | also run DSM with encoded columns: `all`, or any of `plain`, `bitpack`, `for`, `dict`, `rle`, `delta` |
+| `--mode M1,M2` | both | scan modes for encoded layouts: `value`, `vector` |
 
 ## What a run does
 
-1. Generates the table and builds all three layouts. This step is not timed.
+1. Generates the table and builds the selected layouts (and encodes the
+   columns, for encoded layouts). This step is not timed.
 2. Prints the table size in MB, and each layout's actual footprint, to stderr.
 3. Checks that all layouts produce the same `result()` for every query and
    `k`, using a fresh query object per layout. If any differ, it prints the
@@ -129,26 +214,28 @@ event codes and refuse to run on other CPUs.
 It writes one CSV row per timed scan:
 
 ```
-query,layout,rows,cols,k,page_size,iteration,latency_ns,result
+query,layout,dist,rows,cols,k,page_size,footprint_bytes,iteration,latency_ns,result
 ```
 
-`page_size` is `0` for NSM and DSM because they have no pages.
+`page_size` is `0` for every layout except PAX. `footprint_bytes` is the
+layout's actual size in memory (the compressed size for encoded layouts).
 
 ## Example
 
 ```
 $ ./build/scan_bench --rows 1000000 --cols 16 --output results.csv
-Table: 1000000 rows x 16 cols, 122.07 MB of data
+Table: 1000000 rows x 16 cols, 122.07 MB of data, uniform distribution
   NSM footprint: 122.07 MB
   DSM footprint: 122.07 MB
   PAX footprint: 122.078 MB
 Correctness check passed for queries {sum,projection}, k in {1,2,4,8,16}
 
 $ head -3 results.csv
-query,layout,rows,cols,k,page_size,iteration,latency_ns,result
-sum,NSM,1000000,16,1,0,0,4064834,49484225
-sum,NSM,1000000,16,1,0,1,3789312,49484225
+query,layout,dist,rows,cols,k,page_size,footprint_bytes,iteration,latency_ns,result
+sum,NSM,uniform,1000000,16,1,0,128000000,0,6655101,49484225
+sum,NSM,uniform,1000000,16,1,0,128000000,1,6166144,49484225
 ```
 
 Note: while the layouts are being built, the logical table and all three
-layouts are in memory at once, which is about 4× the table size.
+layouts are in memory at once, which is about 4× the table size. Each encoding
+adds its compressed size on top of that.

@@ -2,7 +2,7 @@ CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -march=native -Wall -Wextra -Wpedantic
 CPPFLAGS += -Isrc
 
-SRCS := $(wildcard src/*.cpp src/queries/*.cpp)
+SRCS := $(wildcard src/*.cpp src/queries/*.cpp src/encodings/*.cpp)
 OBJS := $(SRCS:src/%.cpp=build/%.o)
 DEPS := $(OBJS:.o=.d)
 BIN  := build/scan_bench
@@ -32,6 +32,17 @@ PERF_WORDS := perf PERF Perf
 PERF_SET   := $(or $(perf),$(if $(filter $(PERF_WORDS),$(MAKECMDGOALS)),core))
 PERF_FLAGS := $(if $(PERF_SET),--perf $(PERF_SET))
 
+# Encodings (DSM only) and data:
+#   enc=all | enc=dict,rle   also run DSM with every column encoded (plain bitpack for dict rle delta)
+#   mode=value | mode=vector scan mode for encoded layouts (default both)
+#   dist=sorted              data distribution: uniform (default) wide sorted runs zipf
+#   layout=dsm,nsm,pax|none  uncompressed layouts to run; defaults to all, or to dsm when enc= is set
+LAYOUT_SEL := $(or $(layout),$(if $(enc),dsm))
+DATA_FLAGS := $(if $(enc),--encoding $(enc)) $(if $(mode),--mode $(mode)) \
+              $(if $(dist),--dist $(dist)) $(if $(LAYOUT_SEL),--layout $(LAYOUT_SEL))
+# Graph file suffix, so encoded / non-uniform runs don't overwrite the plain graphs.
+GRAPH_SUFFIX := $(if $(enc),_enc)$(if $(dist),_$(dist))
+
 all: $(BIN)
 
 $(BIN): $(OBJS)
@@ -42,23 +53,46 @@ build/%.o: src/%.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 test: $(BIN)
-	./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --k 1,$(TEST_COLS) $(QUERY_FLAGS) $(PERF_FLAGS) \
+	./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --k 1,$(TEST_COLS) $(QUERY_FLAGS) $(PERF_FLAGS) $(DATA_FLAGS) \
 		| python3 scripts/summarize.py
 
 # Graphs: every k (1, 2, 4, ..., N) for every layout. Query qN is written to
 # output/qN/graph_qN.csv and output/qN/graph_qN.png (graph_qN_log.png with `log`).
+# With enc= / dist=, the name gets _enc / _<dist>, e.g. output/q1/graph_q1_enc_sorted.png.
 # With `perf`, each counter metric also gets its own output/qN/graph_qN_<metric>.png.
 VENV := .venv
 
 define GRAPH_ONE
 mkdir -p output/$(1)
-./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --query $(QUERY_$(1)) $(PERF_FLAGS) --output output/$(1)/graph_$(1).csv
-$(VENV)/bin/python scripts/plot.py output/$(1)/graph_$(1).csv output/$(1)/graph_$(1) $(if $(LOGY),--logy)
+./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --query $(QUERY_$(1)) $(PERF_FLAGS) $(DATA_FLAGS) --output output/$(1)/graph_$(1)$(GRAPH_SUFFIX).csv
+$(VENV)/bin/python scripts/plot.py output/$(1)/graph_$(1)$(GRAPH_SUFFIX).csv output/$(1)/graph_$(1)$(GRAPH_SUFFIX) $(if $(LOGY),--logy)
 
 endef
 
 graph: $(BIN) $(VENV)/.installed
 	$(foreach q,$(RUN_IDS),$(call GRAPH_ONE,$(q)))
+
+# `make encodings q1`: for every data distribution, run uncompressed DSM plus every
+# encoding over every k, plot latency vs k (output/qN/graph_qN_enc_<dist>.png), then
+# summarise compression ratio and speedup at k = N per distribution and encoding in
+# output/qN/encodings_qN.{png,csv}. Honours mode=, perf, log, TEST_ROWS and TEST_COLS.
+DISTS := uniform wide sorted runs zipf
+
+define ENC_ONE
+mkdir -p output/$(1)
+./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --query $(QUERY_$(1)) $(PERF_FLAGS) --encoding all --layout dsm $(if $(mode),--mode $(mode)) --dist $(2) --output output/$(1)/graph_$(1)_enc_$(2).csv
+$(VENV)/bin/python scripts/plot.py output/$(1)/graph_$(1)_enc_$(2).csv output/$(1)/graph_$(1)_enc_$(2) $(if $(LOGY),--logy)
+
+endef
+
+define ENC_QUERY
+$(foreach d,$(DISTS),$(call ENC_ONE,$(1),$(d)))
+$(VENV)/bin/python scripts/compare_encodings.py output/$(1)/encodings_$(1) $(foreach d,$(DISTS),output/$(1)/graph_$(1)_enc_$(d).csv)
+
+endef
+
+encodings: $(BIN) $(VENV)/.installed
+	$(foreach q,$(RUN_IDS),$(call ENC_QUERY,$(q)))
 
 $(VENV)/.installed: requirements.txt
 	python3 -m venv $(VENV)
@@ -66,7 +100,7 @@ $(VENV)/.installed: requirements.txt
 	touch $@
 
 # Selectors and `log` are modifiers for test/graph; on their own (`make q1`) they run the test.
-$(SELECTORS) $(LOG_WORDS) $(PERF_WORDS): $(if $(filter test graph,$(MAKECMDGOALS)),,test)
+$(SELECTORS) $(LOG_WORDS) $(PERF_WORDS): $(if $(filter test graph encodings,$(MAKECMDGOALS)),,test)
 	@:
 
 clean:
@@ -74,4 +108,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: all test graph clean $(SELECTORS) $(LOG_WORDS) $(PERF_WORDS) q1 Q1 q2 Q2
+.PHONY: all test graph encodings clean $(SELECTORS) $(LOG_WORDS) $(PERF_WORDS) q1 Q1 q2 Q2

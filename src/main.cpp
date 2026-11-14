@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "dsm.h"
+#include "encoded_dsm.h"
+#include "encodings/encoded_column.h"
 #include "layout.h"
 #include "nsm.h"
 #include "pax.h"
@@ -56,6 +58,11 @@ struct Options {
     std::vector<const QueryEntry*> queries;  // empty -> all
     std::string output;   // empty -> stdout
     std::string perf_set;  // empty -> no hardware counters
+    Distribution dist = Distribution::Uniform;
+    std::size_t run_length = 64;
+    bool nsm = true, dsm = true, pax = true;  // uncompressed layouts to run
+    std::vector<Encoding> encodings;          // encoded DSM layouts; empty -> none
+    std::vector<ScanMode> modes{ScanMode::Value, ScanMode::Vector};
 };
 
 [[noreturn]] void usage(const char* prog) {
@@ -71,7 +78,16 @@ struct Options {
               << "  --output FILE    write CSV to FILE instead of stdout\n"
               << "  --perf SET       also record hardware counters per run; SET is one of";
     for (const auto& s : PerfCounters::set_names()) std::cerr << ' ' << s;
-    std::cerr << "\n";
+    std::cerr << "\n"
+              << "  --dist D         data distribution (default uniform); one of";
+    for (Distribution d : all_distributions()) std::cerr << ' ' << distribution_name(d);
+    std::cerr << "\n"
+              << "  --run-length L   mean run length for --dist runs (default 64)\n"
+              << "  --layout L1,L2   uncompressed layouts to run: nsm,dsm,pax or none (default all)\n"
+              << "  --encoding E1,E2 also run DSM with each column encoded; 'all' or any of";
+    for (Encoding e : all_encodings()) std::cerr << ' ' << encoding_name(e);
+    std::cerr << "\n"
+              << "  --mode M1,M2     scan modes for encoded layouts: value,vector (default both)\n";
     std::exit(1);
 }
 
@@ -112,9 +128,55 @@ Options parse_args(int argc, char** argv) {
         }
         else if (arg == "--output") o.output = val;
         else if (arg == "--perf") o.perf_set = val;
+        else if (arg == "--dist") {
+            if (!parse_distribution(val, o.dist)) {
+                std::cerr << "error: unknown distribution '" << val << "'\n";
+                usage(argv[0]);
+            }
+        } else if (arg == "--run-length") o.run_length = std::stoull(val);
+        else if (arg == "--layout") {
+            o.nsm = o.dsm = o.pax = false;
+            for (const auto& name : split_commas(val)) {
+                if (name == "nsm") o.nsm = true;
+                else if (name == "dsm") o.dsm = true;
+                else if (name == "pax") o.pax = true;
+                else if (name != "none") {
+                    std::cerr << "error: unknown layout '" << name << "'\n";
+                    usage(argv[0]);
+                }
+            }
+        } else if (arg == "--encoding") {
+            o.encodings.clear();
+            if (val == "all") {
+                o.encodings = all_encodings();
+            } else {
+                for (const auto& name : split_commas(val)) {
+                    Encoding e;
+                    if (!parse_encoding(name, e)) {
+                        std::cerr << "error: unknown encoding '" << name << "'\n";
+                        usage(argv[0]);
+                    }
+                    o.encodings.push_back(e);
+                }
+            }
+        } else if (arg == "--mode") {
+            o.modes.clear();
+            for (const auto& name : split_commas(val)) {
+                ScanMode m;
+                if (!parse_scan_mode(name, m)) {
+                    std::cerr << "error: unknown mode '" << name << "'\n";
+                    usage(argv[0]);
+                }
+                o.modes.push_back(m);
+            }
+        }
         else usage(argv[0]);
     }
     if (o.rows == 0 || o.cols == 0) usage(argv[0]);
+    if (!o.nsm && !o.dsm && !o.pax && (o.encodings.empty() || o.modes.empty())) {
+        std::cerr << "error: no layouts selected\n";
+        usage(argv[0]);
+    }
     if (o.ks.empty()) {
         for (std::size_t k = 1; k < o.cols; k *= 2) o.ks.push_back(static_cast<int>(k));
         o.ks.push_back(static_cast<int>(o.cols));
@@ -145,10 +207,18 @@ int main(int argc, char** argv) {
     // --- Setup (untimed): generate data once, build every layout from it. ---
     std::vector<std::unique_ptr<Layout>> layouts;
     try {
-        Table table = generate_table(opt.rows, opt.cols, kSeed);
-        layouts.push_back(std::make_unique<NsmLayout>(table));
-        layouts.push_back(std::make_unique<DsmLayout>(table));
-        layouts.push_back(std::make_unique<PaxLayout>(table, opt.page_size));
+        Table table = generate_table(opt.rows, opt.cols, kSeed, opt.dist, opt.run_length);
+        if (opt.nsm) layouts.push_back(std::make_unique<NsmLayout>(table));
+        if (opt.dsm) layouts.push_back(std::make_unique<DsmLayout>(table));
+        if (opt.pax) layouts.push_back(std::make_unique<PaxLayout>(table, opt.page_size));
+        if (!opt.modes.empty()) {
+            for (Encoding e : opt.encodings) {
+                // Encoded once; the value and vector layouts share the same columns.
+                auto data = std::make_shared<const EncodedColumns>(table, e);
+                for (ScanMode m : opt.modes)
+                    layouts.push_back(std::make_unique<EncodedDsmLayout>(data, m));
+            }
+        }
     } catch (const std::exception& e) {  // logical table is freed on scope exit either way
         std::cerr << "error: " << e.what() << "\n";
         return 1;
@@ -156,7 +226,8 @@ int main(int argc, char** argv) {
 
     const double mb = 1024.0 * 1024.0;
     std::cerr << "Table: " << opt.rows << " rows x " << opt.cols << " cols, "
-              << (opt.rows * opt.cols * sizeof(int64_t)) / mb << " MB of data\n";
+              << (opt.rows * opt.cols * sizeof(int64_t)) / mb << " MB of data, "
+              << distribution_name(opt.dist) << " distribution\n";
     for (const auto& l : layouts)
         std::cerr << "  " << l->name() << " footprint: " << l->footprint_bytes() / mb << " MB\n";
 
@@ -207,11 +278,12 @@ int main(int argc, char** argv) {
         }
     }
     std::ostream& out = opt.output.empty() ? std::cout : file;
-    out << "query,layout,rows,cols,k,page_size,iteration,latency_ns,result";
+    out << "query,layout,dist,rows,cols,k,page_size,footprint_bytes,iteration,latency_ns,result";
     if (counters)
         for (const auto& name : counters->names()) out << ',' << name;
     out << '\n';
 
+    const std::string dist = distribution_name(opt.dist);
     for (const QueryEntry* qe : opt.queries) {
         for (int k : opt.ks) {
             auto q = qe->make(first_k_columns(k), opt.rows);  // untimed setup
@@ -236,9 +308,9 @@ int main(int argc, char** argv) {
                     g_sink = g_sink + result;
                     auto ns =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-                    out << q->name() << ',' << l->name() << ',' << opt.rows << ',' << opt.cols
-                        << ',' << k << ',' << page_size << ',' << i << ',' << ns << ','
-                        << result;
+                    out << q->name() << ',' << l->name() << ',' << dist << ',' << opt.rows
+                        << ',' << opt.cols << ',' << k << ',' << page_size << ','
+                        << l->footprint_bytes() << ',' << i << ',' << ns << ',' << result;
                     if (counters)
                         for (uint64_t v : counters->values()) out << ',' << v;
                     out << '\n';

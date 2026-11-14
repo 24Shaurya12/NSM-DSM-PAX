@@ -20,12 +20,33 @@ from matplotlib.ticker import FuncFormatter, LogLocator  # noqa: E402
 
 from perf_metrics import counter_columns, metrics  # noqa: E402
 
-# Fixed colour per layout so a layout looks the same in every graph.
+# Fixed colour per layout so a layout looks the same in every graph. Encoded DSM layouts
+# (DSM-<encoding>-<mode>) are coloured by encoding and styled by mode: solid = vector,
+# dashed = value. Slots follow the categorical palette order; plain (no compression,
+# only the scan machinery) is a neutral reference.
 LAYOUT_COLORS = {"NSM": "#2a78d6", "DSM": "#eb6834", "PAX": "#1baf7a"}
+ENCODING_COLORS = {"plain": "#6f6e69", "bitpack": "#eda100", "for": "#e87ba4",
+                   "dict": "#008300", "rle": "#6250d6", "delta": "#e34948"}
+MODE_STYLES = {"vector": "-", "value": "--"}
 TEXT = "#0b0b0b"
 MUTED = "#898781"
 GRID = "#e1e0d9"
 SURFACE = "#fcfcfb"
+
+
+def series_order(layout):
+    """Sort key: base layouts first, then encodings in palette order, vector before value."""
+    if layout in LAYOUT_COLORS:
+        return (0, list(LAYOUT_COLORS).index(layout), 0)
+    _, enc, mode = layout.split("-")
+    return (1, list(ENCODING_COLORS).index(enc), list(MODE_STYLES).index(mode))
+
+
+def series_style(layout):
+    if layout in LAYOUT_COLORS:
+        return LAYOUT_COLORS[layout], "-"
+    _, enc, mode = layout.split("-")
+    return ENCODING_COLORS[enc], MODE_STYLES[mode]
 
 
 def load(path):
@@ -42,6 +63,7 @@ def load(path):
             for name, value in metrics(row, counters).items():
                 series[name][key].append(value)
             meta["rows"], meta["cols"] = int(row["rows"]), int(row["cols"])
+            meta["dist"] = row["dist"]
             if int(row["page_size"]):
                 meta["page_size"] = int(row["page_size"])
     return series, meta
@@ -52,7 +74,9 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
     fig.patch.set_facecolor(SURFACE)
     ax.set_facecolor(SURFACE)
 
-    layouts = [l for l in LAYOUT_COLORS if any(key[:2] == (query, l) for key in lat)]
+    layouts = sorted({l for (q, l, _) in lat if q == query}, key=series_order)
+    # Min-max bands are drawn only for a few series; with many they overlap into a wash.
+    bands = len(layouts) <= 4
     all_ks = set()
     for layout in layouts:
         ks = sorted(k for (q, l, k) in lat if q == query and l == layout)
@@ -61,9 +85,10 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
         med = [statistics.median(r) for r in runs]
         lo = [min(r) for r in runs]
         hi = [max(r) for r in runs]
-        color = LAYOUT_COLORS[layout]
-        ax.fill_between(ks, lo, hi, color=color, alpha=0.12, linewidth=0)
-        ax.plot(ks, med, color=color, linewidth=2, marker="o", markersize=6,
+        color, style = series_style(layout)
+        if bands:
+            ax.fill_between(ks, lo, hi, color=color, alpha=0.12, linewidth=0)
+        ax.plot(ks, med, color=color, linestyle=style, linewidth=2, marker="o", markersize=6,
                 markeredgecolor=SURFACE, markeredgewidth=1.5, label=layout,
                 solid_capstyle="round", solid_joinstyle="round")
 
@@ -85,9 +110,9 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
     what = "latency (ms" if metric == "latency" else f"{metric} (median"
     if metric == "latency":
         what += ", median"
-    ax.set_ylabel(f"{what}{scale}; band = min–max)", color=TEXT)
+    ax.set_ylabel(f"{what}{scale}" + ("; band = min–max)" if bands else ")"), color=TEXT)
 
-    subtitle = f"{meta['rows']:,} rows × {meta['cols']} int64 columns"
+    subtitle = f"{meta['rows']:,} rows × {meta['cols']} int64 columns, {meta['dist']} data"
     if "page_size" in meta:
         subtitle += f", PAX page {meta['page_size'] // 1024} KB"
     ax.set_title(f"{query}: {metric} vs k\n", loc="left", color=TEXT, fontsize=12,
@@ -101,7 +126,12 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
     for side in ("left", "bottom"):
         ax.spines[side].set_color(GRID)
     ax.tick_params(colors=MUTED, labelcolor=TEXT)
-    ax.legend(frameon=False, loc="upper left", labelcolor=TEXT)
+    if len(layouts) <= 4:
+        ax.legend(frameon=False, loc="upper left", labelcolor=TEXT)
+    else:  # many series: legend beside the plot so it never covers the lines
+        fig.set_size_inches(9.5, 4.8)
+        ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1), labelcolor=TEXT,
+                  fontsize=8, handlelength=3)
 
     fig.tight_layout()
     fig.savefig(out_path, facecolor=SURFACE)

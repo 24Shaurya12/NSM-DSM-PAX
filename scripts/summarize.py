@@ -31,12 +31,13 @@ def main():
     if not groups:
         sys.exit("summarize.py: no benchmark rows on stdin")
 
-    header = ["query", "layout", "k", "p=k/N", "page_size", "median_ms", "min_ms", "max_ms",
-              "read_GB/s"]
+    header = ["query", "layout", "k", "p=k/N", "page_size", "size_MB", "ratio", "median_ms",
+              "min_ms", "max_ms", "read_GB/s"]
     table = []
     for (query, k, layout), runs in sorted(groups.items()):
         lat = [int(r["latency_ns"]) for r in runs]
-        rows, cols, page_size = (int(runs[0][f]) for f in ("rows", "cols", "page_size"))
+        rows, cols, page_size, footprint = (
+            int(runs[0][f]) for f in ("rows", "cols", "page_size", "footprint_bytes"))
         median = statistics.median(lat)
         table.append([
             query,
@@ -44,10 +45,12 @@ def main():
             str(k),
             f"{k / cols:.3f}",
             str(page_size) if page_size else "-",
+            f"{footprint / 2**20:.2f}",
+            f"{rows * cols * 8 / footprint:.2f}",  # compression ratio vs 8 bytes per value
             f"{median / 1e6:.3f}",
             f"{min(lat) / 1e6:.3f}",
             f"{max(lat) / 1e6:.3f}",
-            f"{rows * k * 8 / median:.2f}",  # input bytes read per ns == GB/s
+            f"{rows * k * 8 / median:.2f}",  # logical (decoded) bytes per ns == GB/s
         ])
     print_table(header, table)
 

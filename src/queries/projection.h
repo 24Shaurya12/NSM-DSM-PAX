@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "aligned_buffer.h"
+#include "encodings/encoded_column.h"
 #include "query.h"
 
 // SELECT c1, c2, ... FROM table.
@@ -19,6 +20,7 @@ public:
     void run(const NsmLayout& t) override;
     void run(const DsmLayout& t) override;
     void run(const PaxLayout& t) override;
+    void run(const EncodedDsmLayout& t) override;
 
     // Position-weighted checksum of the output, so values landing in the wrong row or
     // column are caught, not just wrong values.
@@ -27,4 +29,5 @@ public:
 private:
     std::vector<int> columns_;
     AlignedBuffer<int64_t> out_;
+    AlignedBuffer<int64_t> batch_;  // decode buffer for vectorized scans
 };
