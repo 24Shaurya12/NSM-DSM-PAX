@@ -33,6 +33,37 @@ public:
         return std::make_unique<PlainCursor>(data_.data());
     }
 
+    // Plain columns need no decoding, so these work on the array itself (no copy).
+    std::size_t select(std::size_t start, std::size_t n, const Predicate& p, uint32_t* sel,
+                       int64_t*) const override {
+        const int64_t* v = data_.data() + start;
+        const uint64_t lo = static_cast<uint64_t>(p.lo), span = p.span();
+        std::size_t cnt = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            sel[cnt] = static_cast<uint32_t>(i);
+            cnt += static_cast<uint64_t>(v[i]) - lo <= span;
+        }
+        return cnt;
+    }
+
+    std::size_t refine(std::size_t start, uint32_t* sel, std::size_t cnt, const Predicate& p,
+                       int64_t*) const override {
+        const int64_t* v = data_.data() + start;
+        std::size_t kept = 0;
+        for (std::size_t t = 0; t < cnt; ++t) {
+            const uint32_t pos = sel[t];
+            sel[kept] = pos;
+            kept += p.test(v[pos]);
+        }
+        return kept;
+    }
+
+    void gather(std::size_t start, const uint32_t* sel, std::size_t cnt, int64_t* out,
+                std::size_t stride, int64_t*) const override {
+        const int64_t* v = data_.data() + start;
+        for (std::size_t t = 0; t < cnt; ++t) out[t * stride] = v[sel[t]];
+    }
+
 private:
     AlignedBuffer<int64_t> data_;
 };

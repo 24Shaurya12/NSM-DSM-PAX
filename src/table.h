@@ -16,7 +16,7 @@ struct Table {
 };
 
 // How each column's values are generated. Every column is generated independently.
-//   uniform  uniform in [0, 100)                       (7 bits; the original benchmark data)
+//   uniform  uniform in [0, domain), default domain 100 (7 bits; the original benchmark data)
 //   wide     uniform over the full int64 range          (incompressible)
 //   sorted   increasing: each value = previous + uniform [0, 8)
 //   runs     runs of equal values, values in [0, 2^20), run lengths uniform in
@@ -31,4 +31,5 @@ bool parse_distribution(const std::string& name, Distribution& out);
 
 // Fills a rows x cols table from a fixed-seed mt19937_64.
 Table generate_table(std::size_t rows, std::size_t cols, uint64_t seed,
-                     Distribution dist = Distribution::Uniform, std::size_t run_length = 64);
+                     Distribution dist = Distribution::Uniform, std::size_t run_length = 64,
+                     int64_t domain = 100);

@@ -50,7 +50,7 @@ bool parse_distribution(const std::string& name, Distribution& out) {
 }
 
 Table generate_table(std::size_t rows, std::size_t cols, uint64_t seed, Distribution dist,
-                     std::size_t run_length) {
+                     std::size_t run_length, int64_t domain) {
     Table t;
     t.rows = rows;
     t.cols = cols;
@@ -59,7 +59,7 @@ Table generate_table(std::size_t rows, std::size_t cols, uint64_t seed, Distribu
     std::mt19937_64 rng(seed);
     switch (dist) {
         case Distribution::Uniform: {
-            std::uniform_int_distribution<int64_t> u(0, 99);
+            std::uniform_int_distribution<int64_t> u(0, domain - 1);
             for (auto& v : t.values) v = u(rng);
             break;
         }

@@ -1,8 +1,10 @@
 """Turn the hardware-counter columns of a scan_bench CSV row into per-row metrics."""
 
 # Columns every scan_bench CSV has; anything after these is a perf counter.
-BASE_COLUMNS = ["query", "layout", "dist", "rows", "cols", "k", "page_size",
-                "footprint_bytes", "iteration", "latency_ns", "result"]
+BASE_COLUMNS = ["query", "layout", "strategy", "dist", "rows", "cols", "k", "where", "sel",
+                "page_size", "batch", "knobs", "footprint_bytes", "iteration", "latency_ns",
+                "rows_out",
+                "result"]  # older CSVs had `result` instead of `rows_out`
 
 
 def counter_columns(fieldnames):

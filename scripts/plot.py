@@ -26,7 +26,7 @@ from perf_metrics import counter_columns, metrics  # noqa: E402
 # only the scan machinery) is a neutral reference.
 LAYOUT_COLORS = {"NSM": "#2a78d6", "DSM": "#eb6834", "PAX": "#1baf7a"}
 ENCODING_COLORS = {"plain": "#6f6e69", "bitpack": "#eda100", "for": "#e87ba4",
-                   "dict": "#008300", "rle": "#6250d6", "delta": "#e34948"}
+                   "dict": "#008300", "dictb": "#14a3a3", "rle": "#6250d6", "delta": "#e34948"}
 MODE_STYLES = {"vector": "-", "value": "--"}
 TEXT = "#0b0b0b"
 MUTED = "#898781"
@@ -34,19 +34,35 @@ GRID = "#e1e0d9"
 SURFACE = "#fcfcfb"
 
 
-def series_order(layout):
+# With several strategies per layout, the strategy picks the line style.
+STRATEGY_STYLES = {"early": "--", "early-pipe": ":", "late": "-", "late-branch": "-.",
+                   "auto": (0, (5, 1, 1, 1))}
+
+
+def split_series(name):
+    """'DSM-dict-vector/late s=0.01' -> ('DSM-dict-vector', 'late', ' s=0.01')."""
+    base, _, sel = name.partition(" ")
+    layout, _, strategy = base.partition("/")
+    return layout, strategy, sel
+
+
+def series_order(name):
     """Sort key: base layouts first, then encodings in palette order, vector before value."""
+    layout, strategy, sel = split_series(name)
+    st = list(STRATEGY_STYLES).index(strategy) if strategy in STRATEGY_STYLES else 0
     if layout in LAYOUT_COLORS:
-        return (0, list(LAYOUT_COLORS).index(layout), 0)
+        return (0, list(LAYOUT_COLORS).index(layout), 0, st, sel)
     _, enc, mode = layout.split("-")
-    return (1, list(ENCODING_COLORS).index(enc), list(MODE_STYLES).index(mode))
+    return (1, list(ENCODING_COLORS).index(enc), list(MODE_STYLES).index(mode), st, sel)
 
 
-def series_style(layout):
+def series_style(name):
+    layout, strategy, _ = split_series(name)
     if layout in LAYOUT_COLORS:
-        return LAYOUT_COLORS[layout], "-"
+        return LAYOUT_COLORS[layout], STRATEGY_STYLES.get(strategy, "-")
     _, enc, mode = layout.split("-")
-    return ENCODING_COLORS[enc], MODE_STYLES[mode]
+    return ENCODING_COLORS[enc], STRATEGY_STYLES.get(strategy, MODE_STYLES[mode]) if strategy \
+        else MODE_STYLES[mode]
 
 
 def load(path):
@@ -57,8 +73,17 @@ def load(path):
     with open(path) as f:
         reader = csv.DictReader(f)
         counters = counter_columns(reader.fieldnames or [])
-        for row in reader:
-            key = (row["query"], row["layout"], int(row["k"]))
+        rows = list(reader)
+        # Several strategies (or selectivities) per layout: one series per combination.
+        many_strats = len({r.get("strategy", "-") for r in rows}) > 1
+        many_sels = len({r.get("sel", "1") for r in rows}) > 1
+        for row in rows:
+            name = row["layout"]
+            if many_strats:
+                name += "/" + row["strategy"]
+            if many_sels:
+                name += f" s={float(row['sel']):.3g}"
+            key = (row["query"], name, int(row["k"]))
             series["latency"][key].append(int(row["latency_ns"]) / 1e6)
             for name, value in metrics(row, counters).items():
                 series[name][key].append(value)

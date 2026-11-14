@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 
-class Query;
+#include "query.h"
 
 // Common interface for all physical layouts so the benchmark driver is layout-agnostic.
 // Layouts only own storage; query logic lives in src/queries/.
@@ -21,4 +21,7 @@ public:
 
     // Runs q against this layout by calling q.run(*this) with the concrete layout type.
     virtual void run(Query& q) const = 0;
+
+    // Whether queries can run on this layout with strategy s.
+    virtual bool supports(Strategy) const { return true; }
 };

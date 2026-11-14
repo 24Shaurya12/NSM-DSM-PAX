@@ -16,25 +16,26 @@ def print_table(header, table):
     print("  ".join("-" * w for w in widths))
     prev_group = None
     for r in table:
-        if prev_group is not None and r[:3:2] != prev_group:
+        if prev_group is not None and (r[0], r[3]) != prev_group:
             print()
         print(fmt(r))
-        prev_group = r[:3:2]  # (query, k)
+        prev_group = (r[0], r[3])  # (query, k)
 
 
 def main():
     reader = csv.DictReader(sys.stdin)
     counters = counter_columns(reader.fieldnames or [])
-    groups = defaultdict(list)  # (query, k, layout) -> CSV rows
+    groups = defaultdict(list)  # (query, k, selectivity, layout, strategy) -> CSV rows
     for row in reader:
-        groups[(row["query"], int(row["k"]), row["layout"])].append(row)
+        groups[(row["query"], int(row["k"]), float(row.get("sel", 1) or 1), row["layout"],
+                row.get("strategy", "-"))].append(row)
     if not groups:
         sys.exit("summarize.py: no benchmark rows on stdin")
 
-    header = ["query", "layout", "k", "p=k/N", "page_size", "size_MB", "ratio", "median_ms",
-              "min_ms", "max_ms", "read_GB/s"]
+    header = ["query", "layout", "strategy", "k", "p=k/N", "sel", "page_size", "size_MB", "ratio",
+              "median_ms", "min_ms", "max_ms", "read_GB/s"]
     table = []
-    for (query, k, layout), runs in sorted(groups.items()):
+    for (query, k, sel, layout, strategy), runs in sorted(groups.items()):
         lat = [int(r["latency_ns"]) for r in runs]
         rows, cols, page_size, footprint = (
             int(runs[0][f]) for f in ("rows", "cols", "page_size", "footprint_bytes"))
@@ -42,8 +43,10 @@ def main():
         table.append([
             query,
             layout,
+            strategy,
             str(k),
             f"{k / cols:.3f}",
+            f"{sel:.4g}",
             str(page_size) if page_size else "-",
             f"{footprint / 2**20:.2f}",
             f"{rows * cols * 8 / footprint:.2f}",  # compression ratio vs 8 bytes per value
@@ -59,11 +62,11 @@ def main():
     print("\nHardware counters (median over timed runs; /row = per table row)")
     names = list(metrics(next(iter(groups.values()))[0], counters))
     table = []
-    for (query, k, layout), runs in sorted(groups.items()):
+    for (query, k, sel, layout, strategy), runs in sorted(groups.items()):
         per_run = [metrics(r, counters) for r in runs]
-        table.append([query, layout, str(k)] +
+        table.append([query, layout, strategy, str(k), f"{sel:.4g}"] +
                      [f"{statistics.median(m[n] for m in per_run):.3f}" for n in names])
-    print_table(["query", "layout", "k"] + names, table)
+    print_table(["query", "layout", "strategy", "k", "sel"] + names, table)
 
 
 if __name__ == "__main__":

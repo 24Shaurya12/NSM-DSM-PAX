@@ -38,9 +38,31 @@ inline uint64_t extract(const uint64_t* in, unsigned w, std::size_t i) {
     return w == 64 ? v : v & ((uint64_t{1} << w) - 1);
 }
 
-// Unpacks `groups` whole groups (64 * groups values) of width w from `in` into out.
-// Dispatches once on w to a fully unrolled kernel with constant shifts and masks.
-void unpack(const uint64_t* in, unsigned w, std::size_t groups, uint64_t* out);
+// Unpacks `groups` whole groups (64 * groups values) of width w from `in` into out, adding
+// `base` to every value. Dispatches once on w to a fully unrolled kernel with constant
+// shifts and masks; with set_simd(true), widths 1..25 use an AVX2 kernel instead (8 values
+// per step), which reads up to kPadWords words past the end of the last group, so every
+// packed buffer must end with that much padding (see pad()).
+void unpack(const uint64_t* in, unsigned w, std::size_t groups, uint64_t* out, uint64_t base = 0);
+
+// Sum of the first n values of a packed run of width w starting at `in` (a group
+// boundary), without storing them: fused AVX2 unpack-and-add with set_simd(true) and
+// w <= 25, otherwise unpack one group at a time onto the stack.
+uint64_t sum(const uint64_t* in, unsigned w, std::size_t n);
+
+// Sum over k < m of unzigzag(x_k) * (m - k), for the m zigzag-encoded values of a packed run
+// of width w starting at `in` (a group boundary, padded with zeros to a whole group): the
+// sum of a delta block's values minus m times its first value (see delta.cpp). Fused AVX2
+// unpack-and-multiply-add with set_simd(true) and w <= 25.
+uint64_t weighted_zigzag_sum(const uint64_t* in, unsigned w, std::size_t m);
+
+// AVX2 unpacking on or off (process-wide; scan_bench --simd). Off by default.
+void set_simd(bool on);
+bool simd();
+
+// Zero words to append after the last packed group, for the AVX2 kernel's over-read.
+constexpr std::size_t kPadWords = 4;
+inline void pad(std::vector<uint64_t>& words) { words.resize(words.size() + kPadWords, 0); }
 
 // Zigzag maps signed deltas to unsigned so small negative values stay small.
 inline uint64_t zigzag(uint64_t d) { return (d << 1) ^ (0 - (d >> 63)); }

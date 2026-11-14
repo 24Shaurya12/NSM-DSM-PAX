@@ -1,15 +1,19 @@
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -march=native -Wall -Wextra -Wpedantic
+CXXFLAGS ?= -std=c++17 -O3 -march=native -Wall -Wextra -Wpedantic
 CPPFLAGS += -Isrc
 
+# Output directory; `make BUILD=build-dev` builds a second copy (e.g. while experiments run
+# from build/).
+BUILD ?= build
+
 SRCS := $(wildcard src/*.cpp src/queries/*.cpp src/encodings/*.cpp)
-OBJS := $(SRCS:src/%.cpp=build/%.o)
+OBJS := $(SRCS:src/%.cpp=$(BUILD)/%.o)
 DEPS := $(OBJS:.o=.d)
-BIN  := build/scan_bench
+BIN  := $(BUILD)/scan_bench
 
 # Quick test: one low projectivity (k = 1) and one high projectivity (k = N).
-TEST_ROWS ?= 100000
-TEST_COLS ?= 512
+TEST_ROWS ?= 1000000
+TEST_COLS ?= 16
 
 # Query ids: `make test q1` / `make graph q2` (case-insensitive) restrict test/graph to
 # those queries; without one, all queries run. To add a query, add its id here and map it.
@@ -33,22 +37,52 @@ PERF_SET   := $(or $(perf),$(if $(filter $(PERF_WORDS),$(MAKECMDGOALS)),core))
 PERF_FLAGS := $(if $(PERF_SET),--perf $(PERF_SET))
 
 # Encodings (DSM only) and data:
-#   enc=all | enc=dict,rle   also run DSM with every column encoded (plain bitpack for dict rle delta)
+#   enc=all | enc=dict,rle   also run DSM with every column encoded (plain bitpack for dict dictb rle delta)
 #   mode=value | mode=vector scan mode for encoded layouts (default both)
 #   dist=sorted              data distribution: uniform (default) wide sorted runs zipf
 #   layout=dsm,nsm,pax|none  uncompressed layouts to run; defaults to all, or to dsm when enc= is set
+# Query shape and execution:
+#   sel=0.01,0.1             add a predicate on c0 with these selectivities (one run each)
+#   strategy=early,late      execution strategies (default all but auto)
+#   page=4096,65536          PAX page size(s) (TEST_PAGE_SIZE, default 16384)
+#   batch=auto | batch=1024  rows per vector
+#   knobs="--hugepages --dsm-offset auto --simd --nt-stores"   any other scan_bench flags
+TEST_PAGE_SIZE ?= 16384
 LAYOUT_SEL := $(or $(layout),$(if $(enc),dsm))
 DATA_FLAGS := $(if $(enc),--encoding $(enc)) $(if $(mode),--mode $(mode)) \
-              $(if $(dist),--dist $(dist)) $(if $(LAYOUT_SEL),--layout $(LAYOUT_SEL))
-# Graph file suffix, so encoded / non-uniform runs don't overwrite the plain graphs.
-GRAPH_SUFFIX := $(if $(enc),_enc)$(if $(dist),_$(dist))
+              $(if $(dist),--dist $(dist)) $(if $(LAYOUT_SEL),--layout $(LAYOUT_SEL)) \
+              $(if $(sel),--sel $(sel)) $(if $(strategy),--strategy $(strategy)) \
+              --page-size $(or $(page),$(TEST_PAGE_SIZE)) $(if $(batch),--batch $(batch)) $(knobs)
+# Graph file suffix, so encoded / non-uniform / filtered runs don't overwrite the plain graphs.
+GRAPH_SUFFIX := $(if $(enc),_enc)$(if $(dist),_$(dist))$(if $(sel),_sel)
 
-all: $(BIN)
+# Experiments: `make experiments <name> ...` (names from scripts/experiments.py --names).
+EXPERIMENT_NAMES := $(shell python3 scripts/experiments.py --names 2>/dev/null)
+RUNNING_EXPS := $(filter experiments,$(MAKECMDGOALS))
+PICKED_EXPS  := $(filter $(EXPERIMENT_NAMES),$(MAKECMDGOALS))
+comma := ,
+space := $(subst ,, )
+EXP_ONLY := $(subst $(space),$(comma),$(strip $(PICKED_EXPS) $(subst $(comma),$(space),$(only))))
+
+MEMBENCH := $(BUILD)/membench
+BATCHBENCH := $(BUILD)/batchbench
+
+all: $(BIN) $(MEMBENCH) $(BATCHBENCH)
 
 $(BIN): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-build/%.o: src/%.cpp
+# Standalone memory-hierarchy microbenchmark (latency / bandwidth vs working-set size).
+$(MEMBENCH): src/tools/membench.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+# Vector size vs work per value and fixed cost per vector (which cache level to size for).
+$(BATCHBENCH): src/tools/batchbench.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+$(BUILD)/%.o: src/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
@@ -91,8 +125,11 @@ $(VENV)/bin/python scripts/compare_encodings.py output/$(1)/encodings_$(1) $(for
 
 endef
 
+# `encodings` is also an experiment name: after `experiments` it only selects that experiment.
+ifeq ($(RUNNING_EXPS),)
 encodings: $(BIN) $(VENV)/.installed
 	$(foreach q,$(RUN_IDS),$(call ENC_QUERY,$(q)))
+endif
 
 $(VENV)/.installed: requirements.txt
 	python3 -m venv $(VENV)
@@ -103,9 +140,37 @@ $(VENV)/.installed: requirements.txt
 $(SELECTORS) $(LOG_WORDS) $(PERF_WORDS): $(if $(filter test graph encodings,$(MAKECMDGOALS)),,test)
 	@:
 
+# The experiment suite behind the report (scripts/experiments.py; results/<name>/).
+#   make experiments                     every experiment, in order (about 80 minutes)
+#   make experiments selectivity pax     only these (names: `make experiments list`, README)
+#   make experiments list                list the experiments and their number of runs
+#   quick=1                              1/8 of the rows, into results_quick/ (a smoke test)
+#   force=1                              re-run runs whose output already exists (default: skip)
+#   quiet=1                              don't print each run's results table
+#   detail=1                             full statistics + hardware counters per run instead
+# Then `make figures` / `make report` redraw the figures and rebuild the PDF.
+ifneq ($(RUNNING_EXPS),)
+ifneq ($(filter list,$(MAKECMDGOALS)),)
+experiments:
+	@python3 scripts/experiments.py --list
+else
+experiments: $(BIN) $(MEMBENCH) $(BATCHBENCH)
+	python3 scripts/experiments.py $(if $(EXP_ONLY),--only $(EXP_ONLY)) $(if $(quick),--quick) $(if $(force),--force) $(if $(quiet),--no-summary) $(if $(detail),--detail)
+endif
+# Experiment names after `experiments` are arguments, not targets.
+$(PICKED_EXPS) list:
+	@:
+endif
+
+figures: $(VENV)/.installed
+	$(VENV)/bin/python scripts/figures.py --png
+
+report: figures
+	cd report && latexmk -pdf -interaction=nonstopmode -halt-on-error report.tex
+
 clean:
-	rm -rf build
+	rm -rf $(BUILD)
 
 -include $(DEPS)
 
-.PHONY: all test graph encodings clean $(SELECTORS) $(LOG_WORDS) $(PERF_WORDS) q1 Q1 q2 Q2
+.PHONY: all test graph encodings experiments figures report clean list $(SELECTORS) $(LOG_WORDS) $(PERF_WORDS) q1 Q1 q2 Q2

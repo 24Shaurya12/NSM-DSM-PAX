@@ -8,9 +8,11 @@
 #include "table.h"
 
 // How a query reads an encoded column.
-//   Value:  one ColumnCursor::next() call (virtual) per value.
-//   Vector: one EncodedColumn::decode() call (virtual) per kBatch values into a buffer,
-//           then a tight loop over the buffer.
+//   Value:  one ColumnCursor::next() call (virtual) per value. Tuple at a time, so only the
+//           `early` strategy is supported.
+//   Vector: one virtual call per vector of `batch` values (at most one storage block per
+//           call): decode() into a buffer followed by a tight loop over it (early
+//           strategies), or select() / refine() / gather() on the encoded data (late).
 enum class ScanMode { Value, Vector };
 
 std::string scan_mode_name(ScanMode m);
@@ -39,9 +41,22 @@ public:
 
     void run(Query& q) const override;
 
+    // Value mode reads every column front to back, one value per call, so it can only stitch
+    // tuples (early). The late strategy has one branch-free variant for encoded columns.
+    bool supports(Strategy s) const override {
+        return mode_ == ScanMode::Value ? s == Strategy::Early : s != Strategy::LateBranch;
+    }
+
     Encoding encoding() const { return data_->encoding; }
     ScanMode mode() const { return mode_; }
     const EncodedColumn& column(std::size_t c) const { return *data_->columns[c]; }
+
+    // Average encoded bytes per value over the given columns (for the auto strategy).
+    double value_bytes(const std::vector<int>& cols) const {
+        double bytes = 0;
+        for (int c : cols) bytes += static_cast<double>(data_->columns[c]->footprint_bytes());
+        return cols.empty() ? 8.0 : bytes / (static_cast<double>(rows()) * cols.size());
+    }
 
 private:
     std::shared_ptr<const EncodedColumns> data_;

@@ -39,14 +39,20 @@ def load(path):
         sys.exit(f"compare_encodings.py: {path} is empty")
     cols = int(rows[0]["cols"])
     for r in rows:
-        if int(r["k"]) != cols:
+        if int(r["k"]) != cols or r.get("where", "-") != "-":
             continue
-        lat[r["layout"]].append(int(r["latency_ns"]))
+        # One series per (layout, strategy); each layout is then represented by its
+        # fastest strategy (vector mode: late = column at a time; value mode: early only).
+        lat[(r["layout"], r.get("strategy", "-"))].append(int(r["latency_ns"]))
         footprint[r["layout"]] = int(r["footprint_bytes"])
-    if "DSM" not in lat:
+    if not any(l == "DSM" for l, _ in lat):
         sys.exit(f"compare_encodings.py: {path} has no uncompressed DSM run at k = {cols}; "
                  "run scan_bench with --layout dsm")
-    stats = {l: (statistics.median(v), footprint[l]) for l, v in lat.items()}
+    stats = {}
+    for (l, _), v in lat.items():
+        m = statistics.median(v)
+        if l not in stats or m < stats[l][0]:
+            stats[l] = (m, footprint[l])
     return rows[0]["dist"], rows[0]["query"], int(rows[0]["rows"]), cols, stats
 
 

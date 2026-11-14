@@ -31,6 +31,7 @@ public:
         for (std::size_t i = 0; i < values.size(); ++i)
             codes[i] = std::lower_bound(dict_.begin(), dict_.end(), values[i]) - dict_.begin();
         bits::pack(codes.data(), codes.size(), w_, words_);
+        bits::pad(words_);
     }
 
     std::size_t size() const override { return n_; }
@@ -49,7 +50,54 @@ public:
         return std::make_unique<DictCursor>(dict_.data(), words_.data(), w_);
     }
 
+    // The dictionary is sorted, so codes preserve order: [lo, hi] on values becomes a range
+    // of codes, found with two binary searches. The scan then compares codes and never
+    // touches the dictionary.
+    std::size_t select(std::size_t start, std::size_t n, const Predicate& p, uint32_t* sel,
+                       int64_t* scratch) const override {
+        uint64_t clo, cspan;
+        if (!code_range(p, clo, cspan)) return 0;
+        uint64_t* u = reinterpret_cast<uint64_t*>(scratch);
+        std::size_t cnt = 0;
+        for (std::size_t off = 0; off < n; off += kBlock) {
+            const std::size_t len = std::min(kBlock, n - off);
+            bits::unpack(words_.data() + (start + off) / bits::kGroup * w_, w_,
+                         bits::groups_for(len), u);
+            cnt = select_unpacked(u, len, clo, cspan, static_cast<uint32_t>(off), sel, cnt);
+        }
+        return cnt;
+    }
+
+    std::size_t refine(std::size_t start, uint32_t* sel, std::size_t cnt, const Predicate& p,
+                       int64_t*) const override {
+        uint64_t clo, cspan;
+        if (!code_range(p, clo, cspan)) return 0;
+        std::size_t kept = 0;
+        for (std::size_t t = 0; t < cnt; ++t) {
+            const uint32_t pos = sel[t];
+            sel[kept] = pos;
+            kept += bits::extract(words_.data(), w_, start + pos) - clo <= cspan;
+        }
+        return kept;
+    }
+
+    void gather(std::size_t start, const uint32_t* sel, std::size_t cnt, int64_t* out,
+                std::size_t stride, int64_t*) const override {
+        for (std::size_t t = 0; t < cnt; ++t)
+            out[t * stride] = dict_[bits::extract(words_.data(), w_, start + sel[t])];
+    }
+
 private:
+    // Codes whose values lie in [p.lo, p.hi], as [clo, clo + cspan]; false if none.
+    bool code_range(const Predicate& p, uint64_t& clo, uint64_t& cspan) const {
+        const auto first = std::lower_bound(dict_.begin(), dict_.end(), p.lo);
+        const auto last = std::upper_bound(first, dict_.end(), p.hi);
+        if (first == last) return false;
+        clo = static_cast<uint64_t>(first - dict_.begin());
+        cspan = static_cast<uint64_t>(last - first) - 1;
+        return true;
+    }
+
     std::size_t n_;
     std::vector<int64_t> dict_;
     unsigned w_ = 0;
