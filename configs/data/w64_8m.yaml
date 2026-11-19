@@ -1,0 +1,6 @@
+# 8M rows x 64 int64 columns (4 GB): uniform values, c0 with 1000 distinct values.
+rows: 8_000_000
+cols: 64
+default: {dist: uniform, min: 0, max: 99}
+columns:
+  c0: {dist: uniform, min: 0, max: 999}

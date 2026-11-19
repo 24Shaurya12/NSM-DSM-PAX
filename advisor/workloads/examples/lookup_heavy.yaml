@@ -1,0 +1,4 @@
+name: lookup_heavy          # full-tuple point lookups dominate: expect NSM
+queries:
+  - {name: get, weight: 0.9, op: lookup, cols: all, lookups: 10000, dist: uniform}
+  - {name: report, weight: 0.1, op: sum, cols: [c5], where: "c0 < 100"}

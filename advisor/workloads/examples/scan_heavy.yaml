@@ -1,0 +1,5 @@
+name: scan_heavy            # narrow aggregates: expect DSM or large-page PAX
+queries:
+  - {name: q1, weight: 0.5, op: sum, cols: [c3], where: "c0 < 500"}
+  - {name: q2, weight: 0.3, op: sum, cols: "0-3"}
+  - {name: q3, weight: 0.2, op: sum, cols: [c1, c2], where: "c0 < 50 AND c1 < 50"}

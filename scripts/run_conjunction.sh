@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 source scripts/common.sh
 
 OUT=${OUT:-results/conjunction}
-CPU=${CPU:-2}
+CPU=${CPU:-$(pick_cpu)}   # override to pin elsewhere
 COLS=${COLS:-16}
 KS=${KS:-1,4,16}
 PAGE_SIZE=${PAGE_SIZE:-16384}

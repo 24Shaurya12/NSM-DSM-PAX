@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "exec_options.h"
+
 // A predicate on one attribute, normalised to the closed range lo <= value <= hi.
 // Equality (c = v) has lo == hi; a one-sided comparison uses an int64 limit for the open end.
 struct Predicate {
@@ -14,6 +16,8 @@ struct Predicate {
     int64_t hi = std::numeric_limits<int64_t>::max();
 
     bool matches(int64_t v) const { return lo <= v && v <= hi; }
+    // Same test without a short-circuit, so the compiler can emit it without a branch.
+    bool matches_nobranch(int64_t v) const { return (lo <= v) & (v <= hi); }
 };
 
 // A conjunction: a row qualifies if it satisfies every predicate. Empty means every row.
@@ -35,11 +39,9 @@ struct QueryResult {
 // Throws std::invalid_argument on malformed input.
 Conjunction parse_conjunction(const std::string& text);
 
-// Writes the positions i in [0, n) whose row satisfies every predicate into sel, in increasing
-// order, and returns how many there are. `column(c)` returns a pointer to the n values of
-// column c for this batch of rows. The first predicate scans all n values; each later predicate
-// only re-checks the positions that are still selected.
-template <typename ColumnAt>
+namespace detail {
+
+template <bool Branchless, typename ColumnAt>
 std::size_t select_positions(const Conjunction& where, ColumnAt column, std::size_t n,
                              uint32_t* sel) {
     std::size_t m = 0;
@@ -50,16 +52,46 @@ std::size_t select_positions(const Conjunction& where, ColumnAt column, std::siz
 
     const Predicate& first = where[0];
     const int64_t* v = column(first.col);
-    for (std::size_t i = 0; i < n; ++i)
-        if (first.matches(v[i])) sel[m++] = static_cast<uint32_t>(i);
+    if constexpr (Branchless) {
+        for (std::size_t i = 0; i < n; ++i) {
+            sel[m] = static_cast<uint32_t>(i);
+            m += first.matches_nobranch(v[i]);
+        }
+    } else {
+        for (std::size_t i = 0; i < n; ++i)
+            if (first.matches(v[i])) sel[m++] = static_cast<uint32_t>(i);
+    }
 
     for (std::size_t p = 1; p < where.size(); ++p) {
         const Predicate& pred = where[p];
         v = column(pred.col);
         std::size_t kept = 0;
-        for (std::size_t j = 0; j < m; ++j)
-            if (pred.matches(v[sel[j]])) sel[kept++] = sel[j];
+        if constexpr (Branchless) {
+            for (std::size_t j = 0; j < m; ++j) {
+                uint32_t idx = sel[j];
+                sel[kept] = idx;
+                kept += pred.matches_nobranch(v[idx]);
+            }
+        } else {
+            for (std::size_t j = 0; j < m; ++j)
+                if (pred.matches(v[sel[j]])) sel[kept++] = sel[j];
+        }
         m = kept;
     }
     return m;
+}
+
+}  // namespace detail
+
+// Writes the positions i in [0, n) whose row satisfies every predicate into sel, in increasing
+// order, and returns how many there are. `column(c)` returns a pointer to the n values of
+// column c for this batch of rows. The first predicate scans all n values; each later predicate
+// only re-checks the positions that are still selected. `mode` picks branchy or branch-free
+// evaluation (same result, different CPU behaviour).
+template <typename ColumnAt>
+std::size_t select_positions(const Conjunction& where, ColumnAt column, std::size_t n,
+                             uint32_t* sel, FilterMode mode) {
+    return mode == FilterMode::Branchless
+               ? detail::select_positions<true>(where, column, n, sel)
+               : detail::select_positions<false>(where, column, n, sel);
 }

@@ -1,8 +1,84 @@
-50% selectivity is the worst
 
-for very low selectivity dsm is orders of magnitude better
-than nsm
 
-pax page size decreases and sometimes better than dsm at 16 MB
 
-select * from c0 < S
+//used in hardware.py and calibrate.cpp
+sysfs is used in the project to get the hardware report about the
+system on which the advisor or inference is to be done.
+It is used to record only the static params cache size, page size, cache associativity and no of ways(Altough they are not yet part of the model)
+
+Latency/time params are inferred by running multiple benchmarks to reveal the avg levels on a P-core
+
+For your model, these address two different constraints:
+\[
+\text{waiting-time estimate}\approx
+\frac{\text{number of misses}\times\text{latency}}{\text{MLP}}
+\]
+\[
+\text{bandwidth-time estimate}\approx
+\frac{\text{actual DRAM bytes}}{\text{bandwidth}}
+\]
+Even with substantial overlap, transferring extra bytes consumes bandwidth.
+
+However, your concern about accounting for the same effect twice is valid. Both calibration experiments run with prefetching enabled. Consequently, the measured MLP ratio already reflects whatever prefetching and bandwidth effects occurred in that experiment; it is not a perfectly isolated hardware constant.
+
+The model should therefore treat MLP and B_eff as related empirical measurements, and validate their combination. Dividing measured access time by MLP again, or adding a prefetch penalty already included in that measured time, could double-count effects.
+
+Sometradeoffs are still there in my experiement which might as these are only the approximate expected costs and not figures on the real run
+
+The model should therefore treat MLP and B_eff as related empirical measurements, and validate their combination. Dividing measured access time by MLP again, or adding a prefetch penalty already included in that measured time, could double-count effects.
+
+
+The first-level TLB is misdetected. hw.json says l1_entries: 1024 with a 13.6 ns miss cost. The real first-level TLB is about 96 entries with a ~1.8 ns miss cost: the step at 128 pages.
+Cause: the probe's line placement i*512 + ((i*7)%64)*8 repeats every 64 pages, so it uses only 64 of the 2048 L2 sets.
+At 1024 pages that is 16 lines per set in a 10-way L2. The extra +11 ns is L2 conflict misses, not TLB.
+The 2048-entry second level and the 101 ns walk come from the counter and are fine. On 256 MB tables almost every random access walks anyway, so the impact is small, but random accesses over 4–8 MB spans are over-charged.
+
+Think about further such tradeoffs while calculating the parameters and what effect they can have ? 
+
+Problems in other parts:
+
+
+I also found an implementation inconsistency: fitting adds pax_lookup_extra separately, while the normal prediction path includes it inside the CPU terms multiplied by k_cpu. Therefore, those paths currently apply this parameter differently. I have not modified any files.
+
+With more than one predicate, the estimator multiplies the pass rates, assuming the columns are independent.
+
+
+why don't we always use branchless code. Is there a case where branched code can be faster?
+
+
+What we don't handle now:
+
+At present the only things that we can change in our execution mode are:
+branchy/branchless 
+predicate order
+DSM batch size
+
+
+- Only conjunctions (AND) of ranges on int64 columns. No OR, NOT, strings, joins or GROUP BY.
+
+- Weighted mean time is the only objective. Tail latency, storage size, conversion cost, and update or insert cost are not considered. The workload is read-only by assumption.
+
+ - Cost of changing layouts i snot considered
+
+
+
+
+
+Some observations:
+predicate order was the most important thing that I can change and vary the performance
+
+Can handling less selctive columns benefit me somewhere
+Only the data distributions present in src/distributions.cpp are handled till now no support for real valued data
+
+Weighted mean time is the only objective. Tail latency, storage size, conversion cost, and update or insert cost are not considered. The workload is read-only by assumption.
+
+Current assumption : the queries are independent of each other and do not change the cache or benefit or degrade other quesries(However this is not the case in real world system)
+
+DO we need to consider hybrid starategies
+
+
+
+
+
+
+

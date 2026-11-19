@@ -1,0 +1,5 @@
+name: wide_mixed            # SELECT * at ~1% plus narrow aggregates on a wide table
+queries:
+  - {name: rows, weight: 0.5, op: materialize, cols: all, where: "c0 < 10"}
+  - {name: agg, weight: 0.3, op: sum, cols: [c7], where: "c0 < 100"}
+  - {name: get, weight: 0.2, op: lookup, cols: all, lookups: 1000}

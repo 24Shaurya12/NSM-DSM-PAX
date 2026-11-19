@@ -1,0 +1,6 @@
+# The ground-truth table shape: 256 MB, 16 int64 columns (2M rows).
+size: 256M
+cols: 16
+default: {dist: uniform, min: 0, max: 99}
+columns:
+  c0: {dist: uniform, min: 0, max: 999}

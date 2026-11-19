@@ -11,18 +11,25 @@
 // `tuples_per_page` tuples. Inside a page, column c occupies its own contiguous minipage
 // starting at byte offset c * tuples_per_page * 8. Pages live back-to-back in one aligned
 // buffer at offsets i * page_size, so page boundaries are explicit.
+// Registered as "pax", parameter page=<bytes> (suffix K/M/G allowed; default 16K).
 class PaxLayout : public Layout {
 public:
+    static constexpr std::size_t kDefaultPageSize = 16 * 1024;
+
     PaxLayout(const Table& t, std::size_t page_size);
 
     std::string name() const override { return "PAX"; }
+    LayoutParams params() const override { return {{"page", std::to_string(page_size_)}}; }
     std::size_t rows() const override { return rows_; }
     std::size_t cols() const override { return cols_; }
     std::size_t footprint_bytes() const override { return num_pages() * page_size_; }
 
-    int64_t sum_first_k(int k) const override;
-    QueryResult filter_sum(const Conjunction& where, int k) const override;
-    QueryResult filter_materialize(const Conjunction& where, int k) const override;
+    QueryResult scan_sum(const Projection& project) const override;
+    QueryResult filter_sum(const Conjunction& where, const Projection& project,
+                           const ExecOptions& opts) const override;
+    QueryResult filter_materialize(const Conjunction& where, const Projection& project,
+                                   const ExecOptions& opts) const override;
+    QueryResult lookup(const RowIds& ids, const Projection& project) const override;
     void flush_cache() const override {
         flush_from_cache(buffer_.data(), buffer_.size() * sizeof(int64_t));
     }

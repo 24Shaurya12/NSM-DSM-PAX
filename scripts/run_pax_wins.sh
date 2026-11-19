@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 source scripts/common.sh
 
 OUT=${OUT:-results/pax_wins}
-CPU=${CPU:-2}
+CPU=${CPU:-$(pick_cpu)}   # override to pin elsewhere
 COLS=${COLS:-64}
 SIZE=${SIZE:-1G}
 ITERATIONS=${ITERATIONS:-10}

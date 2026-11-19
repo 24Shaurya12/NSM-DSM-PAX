@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 source scripts/common.sh
 
 OUT=${OUT:-results/selectivity}
-CPU=${CPU:-2}              # a P-core (cpu_core PMU) that is not CPU 0
+CPU=${CPU:-$(pick_cpu)}   # override to pin elsewhere
 COLS=${COLS:-16}
 KS=${KS:-1,4,16}
 PAGE_SIZE=${PAGE_SIZE:-16384}

@@ -5,6 +5,7 @@
 #include "table.h"
 
 // N-ary Storage Model: one contiguous row-major array; (r, c) is at r * cols + c.
+// Registered as "nsm" (no parameters).
 class NsmLayout : public Layout {
 public:
     explicit NsmLayout(const Table& t);
@@ -14,9 +15,12 @@ public:
     std::size_t cols() const override { return cols_; }
     std::size_t footprint_bytes() const override { return data_.size() * sizeof(int64_t); }
 
-    int64_t sum_first_k(int k) const override;
-    QueryResult filter_sum(const Conjunction& where, int k) const override;
-    QueryResult filter_materialize(const Conjunction& where, int k) const override;
+    QueryResult scan_sum(const Projection& project) const override;
+    QueryResult filter_sum(const Conjunction& where, const Projection& project,
+                           const ExecOptions& opts) const override;
+    QueryResult filter_materialize(const Conjunction& where, const Projection& project,
+                                   const ExecOptions& opts) const override;
+    QueryResult lookup(const RowIds& ids, const Projection& project) const override;
     void flush_cache() const override {
         flush_from_cache(data_.data(), data_.size() * sizeof(int64_t));
     }

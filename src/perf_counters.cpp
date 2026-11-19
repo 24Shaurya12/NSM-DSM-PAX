@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <utility>
 
@@ -96,6 +97,19 @@ int open_uncore_event(const std::string& pmu, const std::string& event, double* 
     return perf_event_open(&a, -1, std::stoi(cpumask));
 }
 
+// Memory-controller PMUs that expose DRAM traffic as named sysfs events, in order of
+// preference. Instances are <prefix>0, <prefix>1, ... To support new hardware, add a row.
+struct MemPmu {
+    std::string prefix;
+    const char* read;
+    const char* write;
+};
+const MemPmu kMemPmus[] = {
+    {"uncore_imc_free_running_", "data_read", "data_write"},  // Intel client, free-running
+    {"uncore_imc_", "data_reads", "data_writes"},             // Intel client, older kernels
+    {"uncore_imc_", "cas_count_read", "cas_count_write"},     // Intel server
+};
+
 uint64_t hw_cache(uint64_t cache, uint64_t op, uint64_t result) {
     return cache | (op << 8) | (result << 16);
 }
@@ -129,21 +143,34 @@ PerfCounters::PerfCounters() {
         events_.push_back(e);
     }
 
-    // One free-running IMC PMU per memory controller; sum them all.
-    const std::pair<const char*, const char*> dram[] = {{"dram_read_bytes", "data_read"},
-                                                         {"dram_write_bytes", "data_write"}};
-    for (const auto& [name, ev] : dram) {
-        Event e;
-        e.name = name;
-        for (int i = 0; pmu_type("uncore_imc_free_running_" + std::to_string(i)) >= 0; ++i) {
-            double bytes_per_count = 64.0;
-            int fd = open_uncore_event("uncore_imc_free_running_" + std::to_string(i), ev,
-                                       &bytes_per_count);
-            if (fd < 0) continue;
-            e.fds.push_back(fd);
-            e.scale = bytes_per_count;
+    // DRAM traffic from the first memory-controller PMU family in kMemPmus that this machine
+    // exposes; all instances of that family (one per controller/channel) are summed. Machines
+    // without such a PMU (e.g. most VMs, AMD) report these events as unavailable.
+    const std::size_t n_families = std::size(kMemPmus);
+    for (std::size_t f = 0; f < n_families; ++f) {
+        const MemPmu& m = kMemPmus[f];
+        Event rd, wr;
+        rd.name = "dram_read_bytes";
+        wr.name = "dram_write_bytes";
+        for (int i = 0; pmu_type(m.prefix + std::to_string(i)) >= 0; ++i) {
+            const std::string pmu = m.prefix + std::to_string(i);
+            for (auto [e, ev] : {std::pair<Event*, const char*>{&rd, m.read}, {&wr, m.write}}) {
+                double bytes_per_count = 64.0;
+                int fd = open_uncore_event(pmu, ev, &bytes_per_count);
+                if (fd < 0) continue;
+                e->fds.push_back(fd);
+                e->scale = bytes_per_count;
+            }
         }
-        events_.push_back(e);
+        // Keep the first family that works; after the last one, keep the (empty) events so
+        // the CSV still has the columns.
+        if (!rd.fds.empty() || f + 1 == n_families) {
+            events_.push_back(rd);
+            events_.push_back(wr);
+            break;
+        }
+        for (int fd : rd.fds) close(fd);
+        for (int fd : wr.fds) close(fd);
     }
 
     for (Event& e : events_) e.begin.resize(e.fds.size());

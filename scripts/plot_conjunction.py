@@ -160,6 +160,9 @@ def counters(summary, path, k):
               ("branch_misses_per_row_median", "branch misses per row"),
               ("dram_read_bytes_per_row_median", "DRAM bytes read per row")]
     panels = [(m, l) for m, l in panels if m in summary and summary[m].notna().any()]
+    if len(panels) <= 1:  # only the computed comparisons panel: nothing measured to show
+        print(f"  skipped {path.name} (no counter data)")
+        return
     s1_values = sorted(summary.s1.unique())
     pos = {s: i for i, s in enumerate(s1_values)}
     d_k = summary[summary.k == k]

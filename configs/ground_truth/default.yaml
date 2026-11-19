@@ -1,0 +1,27 @@
+# Ground-truth run (plan §3): every storage configuration of the space x every template x
+# every execution option, per data set. One engine process per (data set, storage config).
+name: laptop_v1
+templates: configs/templates/default.yaml
+space: configs/spaces/default.yaml
+measure:
+  modes: [cold]       # every execution starts with the table evicted from all caches
+  iterations: 5       # timed samples per point (the store keeps all; summaries use the median)
+  warmup: 1
+seed: 1               # lookup id seed
+datasets:
+  # c0 has 1000 distinct values so pass rates down to 0.1% are exact; c1 (second predicate)
+  # and all other columns are uniform in 0..99.
+  - name: w16_uniform
+    cols: 16
+    size: 256M
+    dist: {default: "uniform:lo=0:hi=99", c0: "uniform:lo=0:hi=999"}
+  - name: w64_uniform
+    cols: 64
+    size: 256M
+    dist: {default: "uniform:lo=0:hi=99", c0: "uniform:lo=0:hi=999"}
+  # Second distribution: c0 sorted (qualifying rows contiguous, branches predictable).
+  - name: w16_c0sorted
+    cols: 16
+    size: 256M
+    dist: {default: "uniform:lo=0:hi=99", c0: "sorted:lo=0:hi=999"}
+    families: [f1, f2]

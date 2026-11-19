@@ -1,0 +1,10 @@
+# Candidate space for the advisor and the ground truth (plan §6.1).
+# Storage parameters are chosen once per table; execution options per query.
+storage:
+  nsm: {}
+  dsm: {}
+  pax: {page: [1K, 2K, 4K, 8K, 16K, 64K, 256K, 1M, 4M, 16M]}
+exec:
+  dsm_batch: [256, 1024, 16384, 131072]
+  filter: [branchy, branchless]
+  predicate_order: [selective_first, selective_last]

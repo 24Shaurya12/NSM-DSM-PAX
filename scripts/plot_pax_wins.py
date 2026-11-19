@@ -102,6 +102,9 @@ def counters_figure(summary, path, page):
               ("l1d_misses_per_row_median", "L1D misses per row"),
               ("dtlb_misses_per_row_median", "dTLB misses per row")]
     panels = [(m, l) for m, l in panels if m in summary and summary[m].notna().any()]
+    if not panels:
+        print(f"  skipped {path.name} (no counter data)")
+        return
     s, order = series(summary, page)
     fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 3.6), squeeze=False)
     pending = []

@@ -11,8 +11,8 @@
 // fills up, the batch is consumed by folding it into a checksum, then reused. The consumer does
 // the same work for every layout, so differences come from how each layout gathers a tuple.
 //
-// The checksum weights attribute c by (c + 1), so writing a value into the wrong attribute
-// changes the result and fails the correctness check.
+// The checksum weights output position j by (j + 1), so writing a value into the wrong
+// attribute changes the result and fails the correctness check.
 class TupleSink {
 public:
     static constexpr std::size_t kBatchTuples = 1024;
@@ -21,9 +21,18 @@ public:
 
     // Space for the next output tuple.
     int64_t* next() {
-        if (n_ == kBatchTuples) consume();
-        return buf_.data() + (n_++) * width_;
+        int64_t* s = slot();
+        commit(true);
+        return s;
     }
+
+    // Branch-free variant: write a candidate tuple into slot(), then commit(keep) adds it to
+    // the output only if `keep` is true (otherwise the next slot() reuses the same space).
+    int64_t* slot() {
+        if (n_ == kBatchTuples) consume();
+        return buf_.data() + n_ * width_;
+    }
+    void commit(bool keep) { n_ += keep; }
 
     // Consumes the remaining tuples and returns {number of tuples, checksum}.
     QueryResult finish() {

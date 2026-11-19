@@ -1,0 +1,35 @@
+# Query template set for the ground truth (plan §7.1).
+# Projections are relative to the table width; predicate constants come from target pass
+# rates via the data set's distribution of that column (advisor/data_profile.py).
+projections:
+  p1:   {prefix: 1}           # c0
+  p25:  {prefix_frac: 0.25}   # c0 .. c(W/4 - 1)
+  p100: {all: true}           # SELECT *
+  s25:  {stride: 4}           # c0, c4, c8, ...  (25%, spread over the row)
+
+families:
+  - name: scan                # no filter
+    type: scan
+    ops: [sum, materialize]
+    projections: [p1, p25, p100, s25]
+
+  - name: f1                  # one predicate on c0
+    type: filter
+    ops: [sum, materialize]
+    projections: [p1, p25, p100, s25]
+    predicates:
+      - {col: 0, rates: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 0.9, 1.0]}
+
+  - name: f2                  # c0 (varied) AND c1 (50%), in both evaluation orders
+    type: filter
+    ops: [sum, materialize]
+    projections: [p1, p100]
+    predicates:
+      - {col: 0, rates: [0.001, 0.01, 0.1, 0.5]}
+      - {col: 1, rates: [0.5]}
+
+  - name: lk                  # point lookups
+    type: lookup
+    projections: [p1, p25, p100]
+    counts: [1000, 10000, 100000]
+    id_dists: [uniform, sorted]

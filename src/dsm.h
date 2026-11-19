@@ -7,11 +7,10 @@
 #include "table.h"
 
 // Decomposition Storage Model: one contiguous array of `rows` values per column.
+// Registered as "dsm" (no storage parameters). Filters run in batches of
+// ExecOptions::dsm_batch rows, so the selection vector of a batch stays cache-resident.
 class DsmLayout : public Layout {
 public:
-    // filter_sum works on batches of this many rows, so its selection vector stays in L1.
-    static constexpr std::size_t kBatchRows = 1024;
-
     explicit DsmLayout(const Table& t);
 
     std::string name() const override { return "DSM"; }
@@ -20,10 +19,14 @@ public:
     std::size_t footprint_bytes() const override {
         return columns_.size() * rows_ * sizeof(int64_t);
     }
+    bool uses_batch_rows() const override { return true; }
 
-    int64_t sum_first_k(int k) const override;
-    QueryResult filter_sum(const Conjunction& where, int k) const override;
-    QueryResult filter_materialize(const Conjunction& where, int k) const override;
+    QueryResult scan_sum(const Projection& project) const override;
+    QueryResult filter_sum(const Conjunction& where, const Projection& project,
+                           const ExecOptions& opts) const override;
+    QueryResult filter_materialize(const Conjunction& where, const Projection& project,
+                                   const ExecOptions& opts) const override;
+    QueryResult lookup(const RowIds& ids, const Projection& project) const override;
     void flush_cache() const override {
         for (const auto& col : columns_) flush_from_cache(col.data(), rows_ * sizeof(int64_t));
     }
