@@ -1,0 +1,71 @@
+% COL868 Project 1 report, ACM two-column format (acmart, sigconf).
+% Each section is its own file under sections/, so a partner's sections can be added in place.
+% The longer single-column version with every experiment is in extended/.
+\documentclass[sigconf,nonacm]{acmart}
+\settopmatter{printacmref=false, printccs=false, printfolios=true}
+
+\usepackage{tabularx}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+\graphicspath{{figures/}}
+\newcommand{\fig}[2][\linewidth]{\IfFileExists{figures/#2.pdf}{\includegraphics[width=#1]{#2}}{\fbox{\parbox{0.9#1}{\centering\small figure \texttt{#2} not generated yet (run \texttt{make figures})}}}}
+\newcommand{\gen}[1]{\IfFileExists{generated/#1.tex}{\input{generated/#1.tex}}{\textit{(table \texttt{#1} not generated yet)}}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\ms}{\,ms}
+
+\begin{document}
+
+\title{Comparing NSM, DSM and PAX on One Machine: Layouts, Materialization, Encodings and
+Cache-Aware Tuning}
+\subtitle{COL868 Project 1}
+
+\author{Shaurya}
+\affiliation{\institution{IIT Delhi}\city{New Delhi}\country{India}}
+\author{Yuvraj}
+\affiliation{\institution{IIT Delhi}\city{New Delhi}\country{India}}
+
+\begin{abstract}
+We built an in-memory scan engine in C++ that stores a table as a row store (NSM), a column
+store (DSM) or in PAX pages, and runs selections, projections, aggregations and full-tuple
+reconstruction under early, late and adaptive materialization, with seven column encodings on
+DSM. On an AMD Ryzen~5 5600H we varied projectivity, selectivity, working-set size, PAX page
+size, encoding and vector size. Every result reduces to one count: the cache lines a query
+moves from the level the data lives in, and the CPU work per line. That count explains the
+layout crossovers (DSM up to 15$\times$ faster than NSM for one attribute of 16; NSM wins
+full-tuple reconstruction), the materialization crossovers (late wins below 2.4--7.4\%
+selectivity from DRAM, because a gathered line costs 2.2--3.2 streamed ones), and when
+compression pays (when the query works on the compressed form, or when decoding costs less
+than the $\approx$1 cycle of DRAM bandwidth a plain value takes). Turning each hardware
+parameter into one code choice makes the engine 1.46$\times$ faster over 18 query--layout
+pairs. On a second machine (Intel i7-1360P), a cost model calibrated in 35\,s from
+microbenchmarks chooses the layout, PAX page size and execution options of a workload without
+running it: 16\% median error on 9,315 held-out measurements, and a worst case of 1.51$\times$
+the best on 1000 random workloads, against 8.35$\times$ for the best fixed layout.
+\end{abstract}
+
+\maketitle
+
+\input{sections/intro}
+\input{sections/design}
+\input{sections/method}
+\input{sections/layouts}
+\input{sections/materialization}
+\input{sections/encodings}
+\input{sections/tuning}
+\input{sections/advisor}
+\input{sections/conclusions}
+
+\begin{thebibliography}{5}
+\bibitem{pax} A.~Ailamaki, D.~J.~DeWitt, M.~D.~Hill, M.~Skounakis. Weaving relations for
+cache performance. In \emph{VLDB}, 2001.
+\bibitem{abadi} D.~J.~Abadi, D.~S.~Myers, D.~J.~DeWitt, S.~R.~Madden. Materialization
+strategies in a column-oriented DBMS. In \emph{ICDE}, 2007.
+\bibitem{x100} P.~Boncz, M.~Zukowski, N.~Nes. MonetDB/X100: Hyper-pipelining query execution.
+In \emph{CIDR}, 2005.
+\bibitem{lemire} D.~Lemire, L.~Boytsov. Decoding billions of integers per second through
+vectorization. \emph{Software: Practice and Experience}, 45(1), 2015.
+\bibitem{manegold} S.~Manegold, P.~Boncz, M.~L.~Kersten. Generic database cost models for
+hierarchical memory systems. In \emph{VLDB}, 2002.
+\end{thebibliography}
+
+\end{document}

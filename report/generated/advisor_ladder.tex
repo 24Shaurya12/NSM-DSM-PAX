@@ -1,0 +1,12 @@
+\begin{tabular}{lrrrrr}
+\toprule
+ & \multicolumn{2}{c}{$|$error$|$} & \multicolumn{3}{c}{decisions} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-6}
+Model & med. & p90 & top-1 & med. & max \\
+\midrule
+v0 bytes $\div$ bandwidth & 58\% & 88\% & 18\% & 2.87 & 13.94 \\
+v1 Manegold et al. & 70\% & 618\% & 46\% & 1.47 & 9.43 \\
+v2 + modern memory & 25\% & 65\% & 74\% & 1.16 & 4.91 \\
+v3 + CPU effects & 16\% & 45\% & 72\% & 1.08 & 1.51 \\
+\bottomrule
+\end{tabular}

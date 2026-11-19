@@ -1,0 +1,43 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\section{Design and Implementation}
+\textbf{Data and layouts.} A table has $R$ rows and $N$ attributes of type \code{int64\_t},
+generated once from a seeded PRNG; by default values are uniform in $[0, 10^6)$. \emph{NSM} is
+one row-major array. \emph{DSM} is one array per attribute, each in its own page-aligned
+\code{mmap} so that placement does not depend on the allocator; column $c$ can start
+$c\cdot\delta$ bytes into its allocation (\code{-{}-dsm-offset}). \emph{PAX} uses fixed-size
+pages (default 16\,KB); inside a page each attribute has a contiguous minipage, so with $N{=}16$
+a page holds $P/128$ rows and a minipage is $P/16$ bytes. Rows never cross pages.
+
+\textbf{Queries.} \emph{Projection} (\code{SELECT c$_{i_1}$..c$_{i_k}$ WHERE \ldots}) writes the
+qualifying tuples row-major into an output buffer, so every layout reconstructs tuples; with
+all attributes it is \code{SELECT *}. \emph{Aggregation} computes SUM and COUNT (and AVG)
+without building tuples. Predicates are conjunctions of ranges $\mathit{lo} \le c \le
+\mathit{hi}$ (covering $=$, $<$, $>$), each one unsigned comparison. In the sweeps the predicate
+is \code{c0 < x} with $x$ chosen for an exact selectivity $s$, and the query reads the first $k$
+attributes.
+
+\textbf{Execution.} A layout is presented as \emph{chunks} of at most $B$ rows (the vector size,
+default 1024): a pointer and a stride for NSM, one pointer per attribute for DSM, a PAX page or
+a decoded vector. Kernels are templates over the chunk type, specialised on the number of
+attributes and predicates; without that, DSM early ran 54 instructions per row instead of 12
+and hid every memory effect. The strategies are:
+\begin{itemize}
+  \item \textbf{early}: per row, load all referenced attributes, write the output tuple and
+  advance the cursor by the predicate's 0/1 result (no branch); early SUM masks each row's sum.
+  \item \textbf{late}: build a \emph{selection vector} of qualifying positions from the
+  predicate column (branch-free), then gather each output attribute at those positions, one
+  attribute at a time.
+  \item \textbf{early-pipe} and \textbf{late-branch}: the same with a branch per row. They peak
+  near 50\% selectivity, so we report the branch-free variants.
+  \item \textbf{auto}: early or late per span of $\geq$1024 rows (Section 5).
+\end{itemize}
+
+\textbf{Encodings.} DSM columns can be \emph{bitpack} ($v - \min$ in the minimum width),
+\emph{for} (bitpack per 1024-value block, whose min/max form a zone map), \emph{dict}
+(bit-packed codes into a sorted dictionary), \emph{dictb} (codes of 1, 2 or 4 bytes), \emph{rle}
+and \emph{delta}. Early strategies decode each vector and run the plain kernel; late strategies
+evaluate predicates and SUM on the compressed form (Section 6).
+
+\textbf{Correctness.} Before timing, every configuration runs on every layout and strategy and
+is compared with a naive reference; projections use a position-weighted checksum, so a value in
+the wrong row or slot is caught.

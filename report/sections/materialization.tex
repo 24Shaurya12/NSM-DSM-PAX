@@ -1,0 +1,67 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\section{Early or Late Materialization}
+By line count alone late should beat early at every $s < 1$, since $1/8 + (k-1)/8\, f(s) <
+k/8$. It does not (Table~\ref{tab:crossovers}). First, $f(s)$ grows fast: per 1,000 lines of
+one column, late touches 77 at 1\%, 337 at 5\% and 570 at 10\%, while it wants one value from
+each. Timing late and early on DSM for $k = 1$ to 16 separates two further costs.
+\begin{itemize}
+  \item \textbf{A fixed first pass.} Building the selection vector with scalar code costs about
+  2 cycles per row: late with $k{=}1$ at 0.01\% takes 2.05\,ms for 4M rows, against 1.21\,ms
+  for a bare column read, about 0.7 extra column scans.
+  \item \textbf{A gathered line costs 2.2--3.2 streamed ones.} Gathered lines are sparse and
+  irregular, so the prefetcher cannot run ahead and each is a separate DRAM access. At 5\%,
+  gathering a third of a column's lines (1.28\,ms) takes longer than reading all of it
+  (1.21\,ms).
+\end{itemize}
+The first pass is paid once and every skipped column pays some of it back, so the crossover
+grows with $k$: 1.6\% for 2 attributes, 2.4\% for 4, 7.4\% for 16. In units of one column scan,
+early costs $1 + g$ and late $1 + \sigma + g\,f(s)/\varphi$ ($g$ gathered columns), so late wins
+while $f(s) < \varphi(1-\sigma/g)$. The machine enters through $v$ = line size / value width.
+Fitted on DSM from DRAM, $\varphi = 0.55$ and $\sigma = 2$ predict 2.5\% and 7.8\% for $g = 3$
+and 15, against 2.4\% and 7.4\% measured. They are a joint fit, not the costs measured one at a
+time, because the model assumes a constant cost per column.
+
+\begin{table}[t]
+\caption{Selectivity at which late stops beating early, from DRAM (4M rows) and with the table
+in L3 (32K rows); ``SIMD'': hand-written AVX2 selection vector.}
+\label{tab:crossovers}
+\small
+\begin{tabular}{lrrr}
+\toprule
+DSM & DRAM & L3 & L3, SIMD \\
+\midrule
+SELECT $k{=}2$ & 1.6\% & -- & -- \\
+SELECT $k{=}4$ & 2.4\% & 19--20\% & 37\% \\
+\code{SELECT *} ($k{=}16$) & 7.4\% & 33\% & -- \\
+SUM $k{=}4$ & 1.4\% & never & 3.4\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{In cache, instructions per row decide.} With the table in L3, a gathered line costs an
+L3 hit instead of a DRAM access, so projections favour late far longer (20\% instead of 2.4\% for
+$k{=}4$, 33\% instead of 7.4\% for $k{=}16$). SUM goes the other way. Early's cost is bytes: 4.4
+cycles per row from DRAM, 1.2 in L3, where early's masked sum (no branch, no store) is
+vectorized by the compiler. Late's first pass is instructions: about 2.1 cycles per row from DRAM
+and 1.9 in L3. In L3, building the selection vector alone costs more than early's whole query,
+so late loses even at 0.01\%.
+
+\textbf{A hand-written SIMD selection vector.} The compiler cannot vectorize the selection loop
+although the build allows AVX2: where row $i$ goes depends on how many earlier rows passed (a
+stream compaction). Our kernel compares 8 values with two 64-bit compares, turns the result into
+an 8-bit mask, loads the positions of the set bits from a 256-entry table (8\,KB), stores all 8
+and advances by \code{popcount(mask)}; AVX-512's \code{vpcompressd} would replace the table, but
+Zen 3 lacks it. The first pass drops from about 2 to 0.9 cycles per row, below early's 1.2, and
+late SUM now wins up to 3.4\% in L3 and 5.8\% in L2. From DRAM it is memory-bound and gains only
+at the lowest selectivities.
+
+\textbf{Choosing per span.} \emph{auto} applies the threshold to every span of at least 1024
+rows, using the previous span's selectivity. From DRAM on uniform data it is within 1\% of the
+better fixed strategy on NSM and DSM (always late costs 21\% on DSM, always early 42\%). On
+sorted data the qualifying rows form one stretch, so late is right outside it and early inside;
+auto switches mid-query and beats both by 10\% on DSM on average, up to 24\%. The constants
+depend on where the data lives: in L3 the DRAM pair picks early for \code{SELECT *} at
+10--20\%, up to 2.6$\times$ too slow. Since the engine knows the table's size,
+\code{-{}-auto-cache} switches to a second pair ($\varphi = 1$, $\sigma = 2$) when it fits in
+L3, bringing \code{SELECT *} to 1.02 on average and 1.30 at worst. SUM in cache would need its
+own pair (early SUM vectorizes, early \code{SELECT} does not), and stays up to 1.55$\times$ off.

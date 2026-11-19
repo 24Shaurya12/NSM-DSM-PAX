@@ -1,0 +1,253 @@
+% Layout advisor: predicting the best layout, page size and execution options from a calibrated
+% cost model, validated on a second machine. Figures and tables: scripts/report_advisor.py;
+% data: scripts/run_report.sh (results/report/, results/ground_truth/laptop_v1).
+\section{Choosing the Layout Without Running the Queries}
+\label{sec:advisor}
+
+Sections~4--7 explain each result after measuring it. Here we ask the reverse question:
+\emph{given a machine, a table and a weighted workload, can a model choose the layout, the PAX
+page size and each query's execution options without running the queries?} Our advisor
+calibrates the machine once, describes every query on every layout as the memory accesses its
+loop makes, predicts the time of each combination and searches the candidate space. We
+evaluate it against 10,368 measurements on a second machine.
+
+\subsection{Engine and machine}
+The machine is an Intel Core i7-1360P (Raptor Lake) under native Linux~6.8. We use one
+performance core, with 48\,KB 12-way L1D, 1.25\,MB 10-way L2, 18\,MB 12-way shared L3 and
+64-byte lines, built with \code{-O2 -march=native}. The engine is an earlier branch of ours.
+It has the same data model and layouts as Section~2, and runs queries as follows:
+\begin{itemize}
+  \item \textbf{NSM} works tuple at a time. Predicates either short-circuit (one branch per
+  predicate) or are evaluated branch-free, and contiguous projections are copied with
+  \code{memcpy}.
+  \item \textbf{DSM} processes vectors of $B$ rows ($B$ from 256 to 128K). The first predicate
+  builds a selection vector, later predicates refine it at the surviving positions, and the
+  projected columns are then gathered: Section~2's \emph{late} strategy.
+  \item \textbf{PAX} does the same one page at a time.
+\end{itemize}
+Output tuples go into a 1024-tuple buffer that is folded into a checksum, so writes stay in
+cache. Reconstruction therefore costs gathering, not write-allocate. The options the advisor
+chooses per query are $B$, branchy or branch-free predicates, and predicate order.
+
+The layout results of Section~4 carry over to this machine, though the gaps are smaller:
+\begin{itemize}
+  \item From a 1\,GB table, DSM's \code{SUM(c0)} is 12.6$\times$ faster than NSM's (15$\times$
+  on the Ryzen).
+  \item PAX matches DSM only with pages of 4\,MB or more (0.47\,ns per row for both); 16\,KB
+  pages are 3.1$\times$ slower.
+  \item For the sum of all 16 attributes from DRAM, NSM beats DSM from 20\% selectivity on
+  (1.03--1.13$\times$).
+\end{itemize}
+
+\begin{table}[t]
+\caption{The second machine as calibrated by \code{build/calibrate} (one P-core; bandwidth
+of a sequential read, latency of a random pointer chase).}
+\label{tab:advhw}
+\small\gen{advisor_hw}
+\end{table}
+
+\subsection{Calibration}
+Sysfs reports cache sizes, but not what a miss costs, so \code{build/calibrate} measures every
+constant on the pinned core (\cref{tab:advhw}). Each sample lasts at least 20\,ms, and we take
+the median of 5. The measurements are:
+\begin{itemize}
+  \item \textbf{Levels.} Sequential reads and a random pointer chase over regions from 4\,KB
+  to 1\,GB give each level's bandwidth, latency and capacity knee.
+  \item \textbf{Transfer unit.} Strided loads give $B_\mathrm{eff}$, the DRAM bytes moved per
+  line miss. It is 156\,B, not 64, because the adjacent-line prefetcher fetches pairs of
+  lines.
+  \item \textbf{MLP.} Independent pointer chains give the number of misses that overlap.
+  \item \textbf{TLB.} Chases on 4\,KB and 2\,MB pages give the TLB reach and the page-walk
+  cost.
+  \item \textbf{Prefetcher.} Runs separated by gaps give a table of how many bytes the
+  prefetcher over-fetches.
+  \item \textbf{CPU.} The engine's own kernels, run on in-cache data, give the cycles per row,
+  per gathered value, per vector and per page, and the cost of a mispredicted branch.
+\end{itemize}
+The whole calibration takes 35\,s, and no machine constant appears in the code.
+
+\subsection{Cost model}
+Following Manegold et al.~\cite{manegold}, the advisor describes a query on a layout as a
+composition of basic access patterns:
+\begin{itemize}
+  \item a sequential pass over a region;
+  \item $n$ independent random accesses, used for point lookups;
+  \item a small buffer that is reused, such as the selection vector or the output buffer.
+\end{itemize}
+Patterns are combined sequentially, or concurrently, in which case they share each cache in
+proportion to their footprints. One function per layout produces the pattern from the
+engine's loop.
+
+The central term generalises Section~4's $f(s)$. Let $f$ be the fraction of rows a column is
+read at, and $G$ the mean run of skipped rows. A line holding $v$ candidate values is then
+touched with probability
+\[ p = 1-(1-f)\,(1-1/G)^{\,v-1}. \]
+For independent rows, $G = 1/f$ and this reduces to $1-(1-s)^v$. On sorted or clustered data,
+qualifying rows come in long runs and far fewer lines are touched. $G$ comes from a data
+profile (histograms, sortedness, run lengths) that also estimates each predicate's selectivity.
+
+A pass misses once on every line it touches, because each query starts cold and never comes
+back to a line. A touched line counts as sequential if its neighbour is touched too, and as
+random otherwise. Memory time then sums, over the levels $i$,
+\[ T_\mathrm{mem}=\sum_i M^s_i\,B\Big(\frac{1}{W_{i+1}}-\frac{1}{W_i}\Big)
+ + M^r_i\,\frac{\lambda_{i+1}-\lambda_i}{\mathrm{MLP}}, \]
+where $M^s_i$ and $M^r_i$ are the sequential and random misses at level $i$, $W$ is bandwidth
+and $\lambda$ is latency. TLBs are modelled as caches with 4\,KB lines.
+
+Four corrections bring the model from the published one to a modern machine:
+\begin{itemize}
+  \item misses at the last cache level are counted in units of $B_\mathrm{eff}$;
+  \item random misses overlap, so each costs latency divided by the MLP;
+  \item short runs pay the calibrated prefetch over-fetch;
+  \item page walks inside sequential streams are hidden.
+\end{itemize}
+CPU time $C$ is calibrated cycles times counts: predicate evaluations per row and per
+survivor, gathered values and copied tuples. To it we add the branch misses $\mathit{Br}$
+($2r(1-r)$ per evaluated row, or 0 when the data is sorted) and the per-vector and per-page
+overheads $O$. Finally
+\[ T=\max(k_m T_\mathrm{mem}, T_c)+\gamma\min(k_m T_\mathrm{mem}, T_c),\qquad
+   T_c=k_c C+k_b \mathit{Br}+k_o O . \]
+Each of the six parameters ($k_m$, $k_c$, $k_b$, $k_o$, $\gamma$, and the cost of locating a
+lookup's PAX page) scales one physical term. They are fitted by least squares on
+$\log(\text{predicted}/\text{measured})$.
+
+\textbf{Search.} For each of 12 storage configurations (NSM, DSM, and PAX with pages from
+1\,KB to 16\,MB), every query gets its cheapest options. This per-query choice is exact, because
+the score is a weighted sum and every query starts cold. The configurations are then ranked by
+the weighted mean time. The advisor reports:
+\begin{itemize}
+  \item the runner-up, and a close call when the margin is under 5\%;
+  \item whether the choice still holds with every selectivity scaled by 0.25--4$\times$ and
+  memory 20\% slower or faster.
+\end{itemize}
+A search makes 72 predictions in 20\,ms.
+
+\subsection{Methodology}
+\textbf{Data and workloads.} The ground truth uses three 256\,MB tables, each 14$\times$ the
+L3: 16 attributes, 64 attributes, and 16 attributes with a sorted \code{c0}. \code{c0} has
+1000 distinct values, so selectivities down to 0.1\% are exact. There are four query families:
+\begin{itemize}
+  \item scans;
+  \item one predicate at 10 selectivities from 0.1\% to 100\%;
+  \item a second predicate at 50\%, in both evaluation orders;
+  \item 1K--100K point lookups, uniform or sorted.
+\end{itemize}
+Each family uses four projections: \code{c0}, the first 25\% of the attributes, all of them,
+and every fourth one. Each query is measured on all 12 storage configurations with every
+applicable option, 10,368 points in all.
+
+\textbf{Protocol.} Every point is measured cold: the table is flushed with \code{clflush}
+before each sample. Each point gets 1 warm-up and 5 timed samples, and we report the median.
+Results are checked against a reference first, as in Section~2. The run takes 100\,min. A
+repeat of 10\% of the points differs by a median of 4.3\% (p90 19.6\%), and 30\% of queries
+have a runner-up within 5\%. This noise bounds any decision metric.
+
+\textbf{Splits and metrics.}
+\begin{itemize}
+  \item We fit on 30\% of the queries of the 16-attribute uniform table (1,053 points) and
+  report errors on the other 9,315, which include both other tables.
+  \item Decisions are tested on 1000 random workloads. Each has 2--6 queries from one table,
+  with weights drawn log-uniformly from 1 to 1000.
+  \item A choice is top-1 if its measured time is within 5\% of the best. Regret is the
+  measured time of the choice divided by the best measured time.
+  \item The advisor is charged at the options it picks itself, while fixed rules are given the
+  best measured options.
+\end{itemize}
+
+\begin{table}[t]
+\caption{Model ladder on the 9,315 held-out points (error = predicted $\div$ measured $- 1$)
+and the decisions each rung makes on 1000 random workloads (regret).}
+\label{tab:ladder}
+\small\gen{advisor_ladder}
+\end{table}
+
+\begin{figure*}[t]
+\centering
+\fig[0.92\linewidth]{advisor_accuracy}
+\caption{(a) Predicted against measured latency of the held-out points, by layout.
+(b) Distribution of regret over 1000 random workloads for the advisor and four fixed rules
+(higher and further left is better).}
+\label{fig:advisor}
+\end{figure*}
+
+\subsection{Results}
+\textbf{Accuracy.} \Cref{tab:ladder} adds one group of mechanisms per rung:
+\begin{itemize}
+  \item \textbf{v1}, the model as published, has a p90 error of 618\%. Every random line costs
+  a full DRAM latency, and every miss moves 64 bytes, although the hardware overlaps about 15
+  misses and moves up to 156 bytes per line.
+  \item \textbf{v2} adds $B_\mathrm{eff}$, MLP, over-fetch and hidden walks, which cut the
+  median error to 25\%.
+  \item \textbf{v3} adds branches, per-vector and per-page overheads and overlap, giving 16\%
+  (p90 45\%; \cref{fig:advisor}a).
+\end{itemize}
+Predicted DRAM bytes match the memory-controller counters: predicted $\div$ measured is 0.98
+for NSM, 0.89--0.92 for DSM and 0.87 for PAX.
+
+\begin{table}[t]
+\caption{Decisions on 1000 random workloads: the advisor against fixed rules (which are given
+the best measured options).}
+\label{tab:decisions}
+\small\gen{advisor_decisions}
+\end{table}
+
+\textbf{Decisions.} Always-DSM is the best fixed rule, and also the best single choice in
+hindsight for every table. It is right more often than the advisor (86\% against 72\%,
+\cref{tab:decisions}), but it is 8.35$\times$ slower than the best on lookup-heavy mixes. The
+advisor's worst case is 1.51$\times$, and its median regret is 1.08 (\cref{fig:advisor}b). Judged
+on its storage choice alone, its median regret is 1.00 and its maximum 1.49.
+
+\textbf{Generalisation and robustness.}
+\begin{itemize}
+  \item Fitted on the 16-attribute uniform table without lookups, the model's median error is
+  20\% on the unseen 64-attribute table and 16\% on the unseen sorted one. The decisions do
+  not change (top-1 72\%, worst case 1.54$\times$).
+  \item Scaling any group of calibrated constants by $\pm$20\%, or the MLP by 0.5--2$\times$,
+  changes 0.5--7\% of the decisions.
+  \item Scaling the selectivity estimates by 0.5 or 2 changes 13--15\%, so the estimates
+  matter more than the hardware constants.
+\end{itemize}
+
+\textbf{Example.} On a 4\,GB table of 8M rows $\times$ 64 attributes, the advisor picks:
+\begin{itemize}
+  \item DSM for narrow aggregates, with PAX at 4\,MB pages 1.03$\times$ behind;
+  \item PAX with 4\,MB pages for a mix that is half 1\% \code{SELECT *} and half aggregates
+  and lookups. DSM is 1.01$\times$ behind and NSM 2.07$\times$, and the advisor flags the
+  choice as a close call that holds only for selectivity scaled by 0.8--2$\times$.
+\end{itemize}
+
+\subsection{Analysis}
+\textbf{What the model gets right.} The line count of Section~4 decides the ranking, but its
+cost per line depends on the access pattern:
+\begin{itemize}
+  \item A whole NSM row is 128\,B, and the adjacent-line prefetcher fetches it whole. The model
+  therefore predicts 129\,B per row from DRAM for any $k$, against 105--148\,B measured.
+  Counting 64-byte lines underestimates this by up to 2$\times$.
+  \item A DSM gather touches $f(s)$ of each column's lines, but at random. Those lines are
+  cheap only because about 15 misses overlap, so without MLP the model would make late
+  materialization look many times slower than it is.
+\end{itemize}
+
+\textbf{Where it fails.}
+\begin{enumerate}
+  \item \textbf{Small PAX pages on the 64-attribute table} are over-predicted by up to
+  8$\times$. Footprint-proportional cache sharing gives the 8-byte per-page selection vector a
+  3-byte share of L1, which produces phantom misses. In addition, $k_o = 15.6$ inflates the
+  per-page overhead.
+  \item \textbf{Unfiltered reconstruction} on DSM and PAX is over-predicted by 34--45\%.
+  \item \textbf{Point lookups} are under-predicted by 19--28\%. This appeared once full-size
+  calibration corrected the page-walk cost to 11\,ns; the remaining cost is not yet modelled.
+\end{enumerate}
+
+\textbf{Wrong picks.} Most of the advisor's wrong picks cost little. 157 of its 283 wrong
+choices are PAX with 1\,MB pages where DSM was best, and these two layouts are within the
+noise of each other for most queries. Top-1 accuracy is therefore limited by the 4--20\%
+measurement noise and the many near-ties. The advisor's real value is that it avoids the
+4--12$\times$ losses every fixed rule suffers on some workloads.
+
+\textbf{Summary.} A model built from cache lines and calibrated on a single core in 35\,s
+predicts latency to within 16\% (median). Its picks are on average within 8\% of the best, and
+never more than 1.51$\times$ worse, across layouts, page sizes and execution options. Both the
+model and the search run on another machine after recalibration (\code{make};
+\code{scripts/run\_report.sh}). We have measured only on this one; checking that is future
+work.

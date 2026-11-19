@@ -1,0 +1,19 @@
+\begin{tabular}{lllrrrr}
+\toprule
+$k$ & Layout & Strategy & direct writes & staged + memcpy & staged + NT stores & NT speedup \\
+\midrule
+4 & NSM & early & 30.5 & 37.0 & 25.3 & 1.21$\times$ \\
+4 & NSM & late & 32.7 & 36.4 & 25.2 & 1.30$\times$ \\
+4 & DSM & early & 16.8 & 18.4 & 9.7 & 1.74$\times$ \\
+4 & DSM & late & 22.3 & 24.0 & 14.7 & 1.52$\times$ \\
+4 & PAX & early & 21.1 & 25.6 & 17.3 & 1.22$\times$ \\
+4 & PAX & late & 24.8 & 28.0 & 17.9 & 1.38$\times$ \\
+\midrule
+16 & NSM & early & 67.1 & 85.1 & 41.5 & 1.62$\times$ \\
+16 & NSM & late & 69.7 & 94.9 & 53.2 & 1.31$\times$ \\
+16 & DSM & early & 71.2 & 81.2 & 37.9 & 1.88$\times$ \\
+16 & DSM & late & 99.0 & 100.5 & 66.5 & 1.49$\times$ \\
+16 & PAX & early & 88.9 & 112.4 & 72.3 & 1.23$\times$ \\
+16 & PAX & late & 86.5 & 91.7 & 45.3 & 1.91$\times$ \\
+\bottomrule
+\end{tabular}

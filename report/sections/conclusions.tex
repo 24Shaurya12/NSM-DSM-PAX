@@ -1,0 +1,14 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\section{Conclusions}
+On one core of this laptop every result reduces to the cache lines a query moves from the level
+the data lives in, and the CPU work per line. \textbf{Layouts:} DSM wins when few attributes or
+rows are wanted (up to 15$\times$), NSM wins full-tuple reconstruction, and PAX matches DSM only
+with large pages whose minipages do not alias. \textbf{Materialization:} late wins below
+2.4--7.4\% from DRAM, because a gathered line costs 2.2--3.2 streamed ones, and up to 20--33\%
+for projections in L3; in cache, CPU work per row decides. \textbf{Encodings:} compression wins
+by computing on the compressed form, or when decoding fits in the time DRAM takes per plain
+value, which here needs AVX2. \textbf{Tuning:} each hardware parameter decides one code choice,
+together 1.46$\times$ without changing the queries.
+
+\textbf{Limitations.} One core of one laptop under WSL2, 8-byte integers; the threshold's
+constants were fitted here and should be measured again elsewhere (\code{make experiments}).

@@ -1,0 +1,60 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\section{Layouts: Counting Cache Lines}
+Almost every layout result follows from the number of cache lines a query moves per row
+(Table~\ref{tab:lines}). The central term is $f(s) = 1-(1-s)^v$, the fraction of a column's
+lines that hold at least one selected value: a line is skipped only if all $v$ of its values
+fail. The model matches the counters: DSM early misses L1D 2.2 times per row against a predicted
+2, and late 0.128 vs 0.127 at 0.01\% and 0.32 vs 0.27 at 1\%. It also predicts time: from DRAM a
+streamed line costs 64\,B/28\,GB/s $\approx$ 2.3\,ns and a written one about 5.3\,ns, so NSM
+\code{SELECT *} should take 4M$\,\cdot\,(2\cdot 2.3 + 2\cdot 5.3)$\,ns = 61\,ms; we measured
+61.2\,ms.
+
+\begin{figure*}[t]
+\centering
+\fig[0.8\linewidth]{projectivity}
+\caption{Latency vs the number $k$ of 16 attributes read, no predicate, 4M rows from DRAM. Left:
+SUM. Right: projection into row-major tuples.}
+\label{fig:projectivity}
+\end{figure*}
+
+\textbf{Projectivity} (Figure~\ref{fig:projectivity}). DSM's SUM grows with $k$ (1.0\,ms at
+$k{=}1$, 18\,ms at 16) because it reads $k$ arrays, while NSM's stays at 13--22\,ms because
+every row's two lines come in anyway: 15$\times$ at $k{=}1$, close to the 16$\times$ ratio of
+lines. Projections also write $8k$ bytes per row. DSM still wins up to $k{=}8$ (4.0 vs 19\,ms at
+$k{=}1$), and NSM wins at $k{=}16$ (61 vs 72\,ms), where DSM's $k/8$ input lines plus the cost of
+gathering from 16 places exceed NSM's 2 lines and one copy.
+
+\textbf{Selectivity.} On DSM the strategy matters most: at 0.01\%, late reads $c_0$ and a few
+lines of the rest, and \code{SELECT *} takes 2.3\,ms against early's 21\,ms (9$\times$). NSM
+barely cares, because every row's lines are read either way (15--23\,ms). With 16\,KB pages PAX
+early is slow at every selectivity (\code{SELECT *} 55--63\,ms up to 20\%, 2.6$\times$ DSM
+early) while PAX late tracks DSM late; the reason is the page size (below). Section 5 covers
+where late stops winning. Equalities and conjunctions behave like their combined selectivity,
+since late refines the selection vector only at surviving positions.
+
+\textbf{Working set.} Lines are cheap in cache, so the same counts predict smaller differences:
+the NSM/DSM ratio for SUM(c0) shrinks from 15$\times$ in DRAM to 5$\times$ in L2, and what
+remains is CPU work. For \code{SELECT *}, DSM is the fastest while the table fits in L2
+(2.2--3.1 vs 3.1--3.5\,ns per row) and NSM once it fills L3 (16.1 vs 18.1\,ns from DRAM), so the
+reconstruction crossover depends on where the data lives. Going from L3 to DRAM costs
+2.3--5.8$\times$ for every query, more than any layout difference for wide queries.
+
+\textbf{PAX page size.} Two effects change the cost of a line without changing the count. The
+prefetcher needs a few misses to detect a stream and stops at 4\,KB pages. A DSM column is one
+long stream; a 1\,KB minipage of a 16\,KB page is 16 lines followed by a 15\,KB jump, so
+SUM(c0) pays about 120\,ns (one DRAM latency) per page: 20.1\,ms at 1\,KB pages, 4.9 at 16\,KB,
+2.8 at 64\,KB and 1.2 at 4\,MB, equal to DSM. Early reads 16 such short streams at once. From
+64\,KB pages, the minipages start $P/16$ apart, a multiple of the 4\,KB L1 set stride, so value
+$r$ of all 16 maps to one 8-way set and early \code{SELECT *} at 1\% rises to 63--66\,ms with
+8.6 L1D misses per row (Section 7). The 8--16\,KB pages of disk-based PAX are too small for
+scans in memory.
+
+\textbf{Reconstruction.} DSM and PAX gather each output tuple from $k$ places. Early keeps $k$
+input streams and one output stream open, and beyond about 16 the L1's 8 ways and the
+prefetcher run out (\code{SELECT *} on DSM grows from 63 to 106\,ms as $N$ goes from 4 to 256 at
+fixed size; NSM stays at 66--69\,ms). Late writes a vector's output one attribute at a time,
+touching each output line $v$ times, so its $B\cdot k\cdot 8$-byte tile must stay cached (19 L1
+misses per row at $B{=}1024$, $k{=}16$), and a gather costs about 7 instructions per value
+against 3; at 100\% late is 45\% slower than early (99 vs 68\,ms). NSM's reconstruction is a
+copy, so it wins \code{SELECT *} over many rows and loses when few attributes or rows are
+wanted.

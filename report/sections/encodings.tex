@@ -1,0 +1,55 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\section{Encodings}
+Each data set suits one encoding: uniform values in $[0, 100)$ (7 bits, 9.1$\times$ for
+bitpack), sorted values (delta 15.6$\times$), runs of mean length 64 (rle 32$\times$) and Zipf
+values from 10,000 distinct ones (dict 4.5$\times$, dictb 4.0$\times$).
+
+\textbf{Fewer bytes alone do not help.} Decoding each vector and running the plain kernel is
+slower than plain DSM for every encoding with scalar code, whatever the compression: SUM runs at
+0.80$\times$ for bitpack (9.1$\times$ smaller), 0.69$\times$ for rle (32$\times$ smaller) and
+0.30$\times$ for delta. The scan is no longer limited by bytes but by the instructions that
+decode them.
+
+\begin{table}[t]
+\caption{Decoding first vs working on the compressed form (ms, AVX2, 4M rows $\times$ 8
+attributes, each encoding on its own data set). SUM of all 8 attributes, except for and dict:
+SUM(c0) with a predicate at 0.1--1\%.}
+\label{tab:encodings}
+\small
+\begin{tabular}{llrrr}
+\toprule
+ & on the compressed form & decode & compr. & plain \\
+\midrule
+rle & $\sum$ value $\times$ run length & 11.5 & \textbf{0.10} & 8.4 \\
+delta & $m f + \sum_k d_k (m-k)$ & 24.5 & \textbf{6.4} & 8.0 \\
+bitpack & $m \min + \sum$ offsets & 7.7 & \textbf{4.9} & 7.9 \\
+for & zone maps skip blocks & 4.0 & \textbf{0.09--0.36} & 1.3--1.4 \\
+dict & 14-bit codes, unpacked & 2.6 & 1.63 & \textbf{1.28} \\
+dictb & 2-byte codes, in place & -- & \textbf{0.57} & 1.28 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Computing on the compressed form does} (Table~\ref{tab:encodings}), because the work
+then scales with the compressed size. rle adds value $\times$ run length once per run, 87$\times$
+faster than plain. delta sums each block from its deltas without the prefix sum, a dependency
+chain through every value, and becomes 1.25--1.31$\times$ faster. Predicates on bitpack and for
+compare packed offsets against a translated bound, and gathering 10-bit values brings in 51 per
+line, so late on bitpack beats every uncompressed plan up to 5\%. The same packing lowers the
+late/early crossover, since $f(1\%)$ is already 0.40 with 51 values per line. On sorted data,
+for's zone maps skip or accept whole blocks: up to 15$\times$ faster than late on plain.
+
+\textbf{Codes that fit a SIMD lane.} dict is the exception: its 14-bit codes must be unpacked
+into 32-bit lanes before the comparison, so it loses to plain (1.63 vs 1.28\,ms at 1\%). dictb
+rounds codes up to 1, 2 or 4 bytes, a lane width AVX2 compares directly from memory (16 two-byte
+codes per instruction). It gives up 12\% of the compression and makes the predicate 2.2$\times$
+faster than plain at 1\% and 5.4$\times$ at 0.05\%.
+
+\textbf{When decoding must happen.} Decoding and loading overlap, so a value costs
+$\max(\mathrm{compute}, \mathrm{load})$, and packed wins only when decoding plus adding costs
+less than loading a plain value: about 1 cycle per 8-byte value from DRAM, but only 0.26--0.30
+in L2/L3. Scalar unpacking costs 1.2--1.3 cycles, just over the DRAM budget. AVX2 unpacking with
+the sum fused into it (one byte shuffle and a per-lane variable shift, \code{vpsrlvd}, per 8
+values~\cite{lemire}) costs 0.61--0.68 cycles at every size: 1.42--1.60$\times$ faster than
+plain from DRAM, but 0.40--0.49$\times$ in cache. So on this machine compression pays when the
+uncompressed table would not fit in the L3, and only with SIMD decoding.

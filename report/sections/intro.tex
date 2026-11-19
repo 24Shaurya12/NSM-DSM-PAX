@@ -1,0 +1,21 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\section{Introduction}
+The physical layout of a table decides which bytes a query moves through the memory hierarchy.
+NSM stores each tuple contiguously, so every query reads whole tuples. DSM stores each attribute
+contiguously, so a query reads only the attributes it needs but has to stitch them back into
+tuples. PAX~\cite{pax} keeps NSM's page but stores each attribute of the page in its own
+\emph{minipage}, aiming for DSM's cache behaviour with NSM's locality.
+
+\textbf{Research question.} \emph{How do the layout and the materialization strategy affect the
+latency and cache behaviour of analytical scans across projectivity, selectivity, working-set
+size and PAX page size, and how should the code change to run faster on one specific machine?}
+We study four crossovers: how many attributes before NSM beats DSM, how many rows before early
+beats late materialization~\cite{abadi}, whether the answers change when the table fits in
+cache, and how large a PAX page must be to scan like DSM. For the machine-specific half we
+start, as the project suggests, with materialization (which lines are touched) and compression
+(how many values fit in a line), then extend to vector size, memory placement, output writes
+and page size.
+
+Sections 2 and 3 describe the engine and the measurements. Section 4 explains the layout
+results by counting cache lines, Sections 5 and 6 apply the count to materialization and
+encodings, and Section 7 turns the machine's parameters into tuning rules.

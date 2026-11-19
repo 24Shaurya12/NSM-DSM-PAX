@@ -1,0 +1,12 @@
+\begin{tabular}{lrllllll}
+\toprule
+Predicate & sel. & \multicolumn{3}{c}{SELECT * (16 attributes)} & \multicolumn{3}{c}{SUM of 4 attributes} \\
+ & & NSM & DSM & PAX & NSM & DSM & PAX \\
+\midrule
+\code{c0 = 42} & 1\% & 16.3 (EP) & 7.5 (L) & 13.2 (LB) & 14.7 (L) & 3.1 (L) & 8.2 (LB) \\
+\code{c0 = 42 AND c1 = 7} & 0.011\% & 14.8 (L) & 3.0 (L) & 8.8 (L) & 15.0 (L) & 2.9 (L) & 8.2 (LB) \\
+\code{c2 BETWEEN 10 AND 29} & 20\% & 30.4 (EP) & 29.7 (EP) & 37.1 (L) & 15.8 (L) & 3.5 (E) & 8.9 (E) \\
+\code{c2 BETWEEN 10 AND 29 AND c5 < 50} & 10\% & 25.2 (EP) & 26.8 (E) & 33.7 (L) & 16.2 (L) & 4.5 (E) & 12.6 (E) \\
+\code{c3 = 5 AND c6 BETWEEN 0 AND 49} & 0.5\% & 15.7 (L) & 5.6 (L) & 12.3 (LB) & 17.0 (LB) & 3.8 (L) & 10.4 (LB) \\
+\bottomrule
+\end{tabular}

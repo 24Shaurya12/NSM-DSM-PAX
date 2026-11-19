@@ -1,0 +1,43 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\begin{table}[t]
+\caption{One core of the test machine, measured by our microbenchmark (latency: random pointer
+chase; bandwidth: sequential).}
+\label{tab:machine}
+\small\gen{machine_table}
+\end{table}
+
+\begin{table}[t]
+\caption{Cache lines moved per row ($v{=}8$ values per line, $k$ of $N$ attributes read,
+predicate on one of them, selectivity $s$). Each output line is also read first unless written
+with streaming stores.}
+\label{tab:lines}
+\small
+\begin{tabular}{lll}
+\toprule
+ & input lines & output lines \\
+\midrule
+NSM, any strategy & $\lceil N/8\rceil$ (2 for $N{=}16$) & $s\,k/8$ \\
+DSM / PAX, early & $k/8$ & $s\,k/8$ \\
+DSM / PAX, late & $1/8 + (k-1)/8 \cdot f(s)$ & $s\,k/8$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Methodology}
+\textbf{Machine.} An AMD Ryzen~5 5600H laptop (Zen 3, up to 4.2\,GHz) under WSL2: 32\,KB 8-way
+L1D (64 sets, so addresses 4\,KB apart share a set), 512\,KB L2, 16\,MB shared L3, 64-byte lines,
+AVX2 but no AVX-512 (Table~\ref{tab:machine}). Two numbers recur: DRAM delivers about 7 bytes
+per cycle to one core, so a scan of 8-byte values stays memory-bound only below about 1.2 cycles
+per value; and a store that misses first reads the line (write-allocate), so writes reach
+12\,GB/s against 28 for reads.
+
+\textbf{Protocol.} Only the query's \code{run()} is timed; data, layouts and output buffers are
+built before. Runs are pinned to one core. Each configuration gets one warm-up and 5 timed runs
+in each of 3 rounds that interleave all configurations, so slow periods of the WSL2 host hit all
+of them; we report medians. The default table is 4M rows $\times$ 16 attributes, 512\,MB per
+layout (32$\times$ the L3), so scans come from DRAM; cache-resident tables are rescanned until a
+sample lasts 10--20\,ms. DSM columns start 17 lines apart unless placement is the variable
+(Section 7). Hardware counters (cycles, instructions, L1D misses, dTLB misses) come from
+\code{perf\_event\_open}, at most five per group because WSL2 leaves five counters free. All
+experiments are scripted (\code{scripts/experiments.py}), and every table and figure is
+regenerated from the CSVs in \code{results/}.

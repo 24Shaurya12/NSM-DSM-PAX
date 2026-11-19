@@ -1,0 +1,76 @@
+% Shaurya's section, transcribed verbatim from his compiled report (report-1.pdf).
+\section{Tuning for This Machine}
+Table~\ref{tab:rules} lists the rules; the ones that need explanation follow.
+
+\textbf{Vector size depends on the work, not on one cache level.} A vector's buffers live in
+L1, L2 or L3 depending on $B$. Work per value favours small vectors and a fixed cost per vector
+favours large ones, and a synthetic benchmark shows either can win: random reads inside the
+vector are fastest with L1-sized buffers (1.34 vs 1.69 and 2.55\,ns per value for L2 and L3
+sizes), the same with 2\,$\mu$s per vector with L2-sized ones (1.90\,ns), and light work with
+20\,$\mu$s per vector with L3-sized ones (1.69 vs 12.05\,ns for L1). Our scans read their buffers
+sequentially, and an L2 hit streams nearly as fast as an L1 hit (130 vs 122\,GB/s), so L1-sized
+vectors cut L1D misses but not time, while small vectors slow decoding. The rule keeps every byte
+a vector touches in a quarter of L2.
+
+\begin{table*}[t]
+\caption{Each machine parameter decides one code choice. Knobs are computed from sysfs at
+start-up and are off in the untuned baseline. Times are from DRAM unless noted.}
+\label{tab:rules}
+\small
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.17\textwidth}>{\raggedright\arraybackslash}p{0.12\textwidth}Xp{0.21\textwidth}}
+\toprule
+Parameter & Decides & Rule & Effect \\
+\midrule
+Line size, value width; where the table lives & early or late & late while $f(s) <
+\varphi(1-\sigma/g)$; one constant pair for DRAM, one for tables that fit in L3 & within 1\% of
+the better fixed strategy on DSM; \code{SELECT *} in L3 worst case 2.6$\times$ $\to$
+1.3$\times$ \\
+Cache sizes vs work per value & vector size & buffers in $\frac{1}{4}$ of L2 for our scans &
+decoding SUM 11.9 $\to$ 9.9\,ms vs an L1-sized vector \\
+L1: 64 sets $\times$ 8 ways, 4\,KB stride & DSM column starts, PAX minipage stride & column $c$
+starts $17c$ lines in; minipages of an odd number of lines & early \code{SELECT *} at 1\%: DSM
+62.6 $\to$ 22.9\,ms, PAX (64\,KB) 65.6 $\to$ 27.8\,ms \\
+Write-allocate (12 vs 40\,GB/s with streaming stores) & how output is written & normal stores
+into a cache-resident stage, copied out with streaming stores & \code{SELECT *} of every row
+1.2--1.9$\times$ (DSM early 71.2 $\to$ 37.9\,ms) \\
+Prefetcher stops at 4\,KB pages & PAX page size & 256\,KB pages & PAX SUM(c0) 4.5 $\to$
+1.2\,ms \\
+dTLB reach (2048 entries $\times$ 4\,KB = 8\,MB) & OS page size & 2\,MB pages for buffers
+$\geq$ 2\,MB & late SUM of 16 columns 23.3 $\to$ 18.7\,ms \\
+AVX2, no compress instruction & kernels, code width & SIMD selection vector, fused
+unpack-and-add, byte-aligned dictionary codes & see Sections 5 and 6 \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\textbf{Cache sets.} Streams read in lockstep must not share an L1 set. Staggering DSM columns by
+17 lines (coprime to the 64 sets) puts up to 64 columns in distinct sets; shortening PAX
+minipages to an odd number of lines (64 $\to$ 63 at 64\,KB, 1.6\% of space) does the same for
+large pages. Padding by 64 bytes does not, because the stride stays $P/16$. The gain is large
+only where early reads 16 streams and little is written: at 100\% or for SUM of 16 attributes,
+the misses halve but time improves only 1.1$\times$.
+
+\textbf{Output writes.} Streaming stores skip the read before write, but only for whole lines
+written in order, and our writes are scattered (early overwrites a failing row's slot, late
+writes one attribute at a time). So each vector writes into a cache-resident stage with normal
+stores, which absorb the scattered writes, and the stage is copied out with streaming stores. A
+stage copied with \code{memcpy} is up to 36\% \emph{slower}: the gain is the streaming copy.
+
+\textbf{Huge pages.} With 2\,MB pages, dTLB misses for SUM of 16 DSM columns fall from 0.031 to
+0.008 per row for both strategies, but only late gets faster (20\% vs 3\%): early's 16
+interleaved columns keep loads going during a page walk, while late's single stream waits.
+
+\textbf{Together}, over six queries $\times$ three layouts from DRAM, against an untuned engine
+given the best of four fixed strategies per cell, the tuned engine is \textbf{1.46$\times$}
+faster (geometric mean; NSM 1.11$\times$, DSM 1.41$\times$, PAX 1.96$\times$), up to 3.8$\times$
+for PAX SUM(c0). \code{SELECT *} of every row gains 1.7--2.5$\times$, after which NSM no longer
+wins it (36.9\,ms, DSM 34.6, PAX 31.7). Queries that already move few lines gain little (DSM
+SUM(c0): 1.03$\times$).
+
+\textbf{Tried and dropped.} Instead of a threshold, auto can time both strategies per span and
+run the cheaper one, with \code{-{}-auto-measure}. This bounds the worst case in L3 to
+1.16$\times$, but costs 2--5\% where the threshold is right and 5--15\% in cache; the tuned run
+above used it. \emph{One gather pass for all columns} took 0.97--1.11 times as long below 5\%,
+because the per-column loop already keeps many misses in flight. \emph{SUM over dictionary codes
+by counting} was 10--25\% slower than one lookup per row, because counter updates to the same
+code wait on each other through memory.
