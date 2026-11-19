@@ -1,16 +1,7 @@
 # NSM / DSM / PAX: scan engine and layout advisor
 
-This repository has two parts.
-
-1. **A scan engine** (C++17, `src/`). It stores one in-memory `int64` table as NSM (row store),
-   DSM (column store) or PAX (pages split into per-column minipages). It runs scans,
-   equality/range predicates, SUM/COUNT, tuple reconstruction and point lookups, and measures
-   latency and hardware counters.
-2. **A layout advisor** (Python, `advisor/`). Given a machine, a data set and a weighted
-   workload, it recommends the layout, its parameters (PAX page size) and the execution options of
-   each query (DSM batch size, branchy or branch-free filter, predicate order), and predicts the
-   time. It uses a cost model calibrated on the machine, and is validated against measured
-   ground truth.
+How to set up and run the scan engine (`build/scan_bench`, C++) and the layout advisor
+(`python3 -m advisor`, Python), and how to vary every parameter.
 
 Contents:
 [Setup](#1-setup) ·
@@ -20,9 +11,7 @@ Contents:
 [Advisor](#5-the-layout-advisor) ·
 [Ground truth and validation](#6-ground-truth-and-validation) ·
 [Modes](#7-summary-of-run-modes) ·
-[Reproducing the results](#8-reproducing-the-report-results) ·
-[Code layout](#9-code-layout) ·
-[Extending](#10-extending)
+[Reproducing the results](#8-reproducing-the-report-results)
 
 ---
 
@@ -82,9 +71,9 @@ calibrate first (§5.1); it takes under a minute.
 
 ## 3. The engine (`build/scan_bench`)
 
-One process builds a table once, builds each requested layout, checks every layout × query ×
-option against a reference implementation, then times them and writes one CSV row per timed
-sample. Run `./build/scan_bench --help` for the full list.
+One run builds the table and the requested layouts, checks every result against a reference,
+then times each layout × query × option and writes one CSV row per sample. Run
+`./build/scan_bench --help` for the full list.
 
 ### 3.1 What you can vary
 
@@ -206,16 +195,9 @@ python3 -m advisor calibrate --out configs/hw/mymachine.json            # full (
 python3 -m advisor calibrate --out configs/hw/quick.json --max-size 512M --samples 3   # faster
 ```
 
-The calibration runs `build/calibrate` on the pinned core. It measures:
-- bandwidth and latency of every cache level and DRAM, and where the capacity knees are;
-- TLB reach and page-walk cost;
-- the effective DRAM transfer unit and the prefetcher's over-fetch;
-- memory-level parallelism;
-- the engine's own CPU cost per row, value, batch and page, and the branch-miss cost.
-
-Cache sizes come from sysfs. Everything else is measured, so the same code works on any machine.
-`--raw FILE` keeps the raw measurements, and `python3 -m advisor derive RAW --out hw.json`
-re-derives `hw.json` from them.
+The calibration runs on the pinned core and writes everything the advisor needs about the
+machine into the JSON file. `--raw FILE` keeps the raw measurements, and
+`python3 -m advisor derive RAW --out hw.json` re-derives `hw.json` from them.
 
 ### 5.2 Describe the data and the workload
 
@@ -264,20 +246,14 @@ python3 -m advisor predict --hw $H --data $D --query "op=materialize;cols=all;wh
 python3 -m advisor maps --hw $H --data $D --grid selectivity-projection --op sum --out results/maps
 ```
 
-The `recommend` report shows:
-- the chosen storage, the predicted time, and the runner-up with its margin (flagged as a close
-  call under 5%);
-- the best configuration of each layout, and the worst option;
-- per query: its share of the time, the memory/CPU split, the DRAM bytes and the chosen execution
-  options;
-- a sensitivity check: whether the choice still holds with every selectivity scaled by 0.25–4×
-  and with memory 20% slower or faster. Use `--no-sensitivity` to skip it.
+`recommend` prints the chosen storage, the predicted time, the runner-up, the execution options of
+each query and a sensitivity check (`--no-sensitivity` skips it).
 
 Options common to the three commands:
 
 | Option | Values | Default |
 |---|---|---|
-| `--model` | `v0` (bytes ÷ bandwidth), `v1` (Manegold et al. as published), `v2` (+ modern memory: transfer unit, MLP, over-fetch, hidden page walks), `v3` (+ branch misses, per-batch/page overheads, memory/CPU overlap) | `v3` |
+| `--model` | `v0`, `v1`, `v2`, `v3` (from the simplest to the full cost model) | `v3` |
 | `--params FILE` | fitted model parameters (`params_v3.json`, written by validation, §6.2) | unfitted defaults |
 | `--estimator` | `profile` (from data.yaml distributions), `histogram` (from `hist:`), `fixed` (the workload's `rates:`) | `profile` |
 | `--objective` | `mean` (expected time per query) or `total` (sum of weighted times) | `mean` |
@@ -357,15 +333,8 @@ python3 -m advisor evaluate --store STORE --hw HW --out DIR \
     [--workloads 1000] [--seed 1] [--no-robustness | --quick]
 ```
 
-`evaluate` writes `report.md`, `params_v3.json`, CSVs and plots. It reports:
-- **V1:** prediction error per model and per query group;
-- **V2/V3:** decisions on random workload mixes, judged by top-1 (within 5%) and regret (measured
-  time of the choice ÷ best), against fixed rules such as always-NSM, always-DSM, always-PAX-16K
-  and "DSM unless lookups";
-- **V4:** generalisation, with `--fit-split dataset:...`;
-- **V5:** decision maps, predicted against measured;
-- **V7:** robustness: how many decisions change when calibration constants or selectivities are
-  perturbed.
+`evaluate` writes `report.md` (accuracy, decisions against fixed rules, decision maps, robustness),
+`params_v3.json` (pass it to `--params`), CSVs and plots.
 
 ---
 
@@ -412,54 +381,3 @@ Each stage's outcome is listed in `results/report/status.txt`.
 
 **Building the report.** `cd report && pdflatex report.tex && pdflatex report.tex`. Figures are
 in `report/figures/` and generated tables in `report/generated/`.
-
----
-
-## 9. Code layout
-
-```
-src/                        engine
-  layout.h                  Layout interface (scan_sum, filter_sum, filter_materialize, lookup)
-  nsm.* dsm.* pax.*         the three layouts, each registered in layout_factory
-  layout_factory.*          "nsm", "dsm", "pax:page=256K" -> Layout
-  query_spec.* projection.h queries (op x columns x predicates x lookups) and the --query parser
-  predicate.*               predicates; selection vectors (branchy / branch-free)
-  exec_options.h            per-query options: DSM batch, filter mode, threads (reserved)
-  distributions.* table.*   value generators and the logical table
-  row_ids.*                 lookup id generators (uniform, sorted)
-  tuple_sink.h              output buffer for reconstructed tuples (checksummed)
-  reference.*               reference executor used by the correctness checks
-  perf_counters.*           hardware counters (core PMU; memory-controller PMUs for DRAM bytes)
-  main.cpp                  scan_bench driver
-tools/calibrate.cpp         calibration micro-benchmarks (build/calibrate)
-tools/assoc_probe.cpp       L1 associativity probe: g++ -std=c++17 -O2 -march=native -Isrc \
-                              tools/assoc_probe.cpp src/perf_counters.cpp -o build/assoc_probe
-tests/engine_tests.cpp      engine tests (make test);  tests/advisor/*.py  advisor tests
-advisor/                    layout advisor (python3 -m advisor ...)
-  cli.py                    recommend | predict | maps (+ validate, evaluate, calibrate, derive, ground-truth)
-  hardware.py               calibration -> hw.json
-  data_profile.py selectivity.py workload.py   inputs and selectivity estimators
-  candidates.py             candidate space; search/  exhaustive search
-  models/                   cost models v0-v3 (ladder.py) and access patterns (patterns/)
-  ground_truth.py engine.py measurement store and engine adapter
-  validate.py evaluate.py   accuracy, decisions, maps, robustness
-  workloads/                templates, random workload generator, examples
-configs/                    hw/ (calibrations), data/, spaces/, templates/, ground_truth/
-scripts/                    sweeps, plots, ground truth, validation, full pipeline
-report/                     ACM-format report (report.tex, sections/, figures/, generated/)
-```
-
----
-
-## 10. Extending
-
-Each component sits behind a registry, so additions go in one place:
-
-| To add | Do this |
-|---|---|
-| a layout | implement `Layout` in `src/<name>.{h,cpp}` and register it with `register_layout`; describe its access patterns in `advisor/models/patterns/describe.py`; add its parameters to a space file |
-| a data distribution | a generator in `src/distributions.cpp` and a model class in `advisor/data_profile.py` |
-| a cost model | a class with `@register_model("name")` in `advisor/models/` |
-| a selectivity estimator | a class with `@register_estimator("name")` in `advisor/selectivity.py` |
-| a search strategy | a class with `@register_search("name")` in `advisor/search/` |
-| a machine | nothing in the code: run `python3 -m advisor calibrate` on it |
