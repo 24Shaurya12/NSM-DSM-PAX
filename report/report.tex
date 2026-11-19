@@ -1,0 +1,354 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=2cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{positioning,calc,decorations.pathreplacing}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+\definecolor{nsm}{HTML}{2a78d6}
+\definecolor{dsm}{HTML}{eb6834}
+\definecolor{pax}{HTML}{1baf7a}
+\definecolor{codebg}{HTML}{f6f5f1}
+\lstset{basicstyle=\ttfamily\footnotesize, columns=fullflexible, keepspaces=true,
+  backgroundcolor=\color{codebg}, frame=none, xleftmargin=4pt, xrightmargin=4pt,
+  aboveskip=4pt, belowskip=4pt, language=C++, keywordstyle=\bfseries,
+  commentstyle=\itshape\color{black!60}, showstringspaces=false}
+
+\graphicspath{{figures/}}
+\newcommand{\fig}[2][\linewidth]{\IfFileExists{figures/#2.pdf}{\includegraphics[width=#1]{#2}}{\fbox{\parbox{0.9#1}{\centering\small figure \texttt{#2} not generated yet (run \texttt{make figures})}}}}
+\newcommand{\gen}[1]{\IfFileExists{generated/#1.tex}{\input{generated/#1.tex}}{\textit{(table \texttt{#1} not generated yet)}}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\ms}{\,ms}
+\newcommand{\ns}{\,ns}
+
+\title{Comparing NSM, DSM and PAX on one machine:\\ layouts, materialization, encodings and cache-aware tuning}
+\author{Shaurya \quad--\quad COL868, Project 1}
+\date{}
+
+\begin{document}
+\maketitle
+
+
+\begin{abstract}
+\noindent
+We built an in-memory scan engine in C++ that stores one table as a row store (NSM), a column
+store (DSM) or in PAX pages, and runs selections, projections, aggregations and full-tuple
+reconstruction over it under early, late and adaptive materialization. DSM columns can also be
+stored in seven encodings, with predicates and aggregates evaluated on the compressed data. On
+an AMD Ryzen~5 5600H we varied projectivity, selectivity, working-set size, PAX page size,
+encoding and vector size, and measured latency and hardware counters. The results reduce to
+one count: the cache lines a query moves from the level of the hierarchy the data lives in,
+and what the CPU does with each of them. That count explains the layout crossovers (DSM is up
+to 15$\times$ faster than NSM for one attribute of 16, NSM wins full-tuple reconstruction), the
+materialization crossovers (late wins below 2.4--7.4\% selectivity from DRAM, because a
+gathered line costs 2.2--3.2 streamed ones), and when compression pays (when the query works on
+the compressed form, e.g.\ 87$\times$ for SUM over run lengths, or when decoding costs less
+than the $\approx$1 cycle of DRAM bandwidth a plain value takes, which needs AVX2). It also
+tells us how to tune the engine for this machine: one hardware parameter decides one code
+choice, and together they make the engine 1.46$\times$ faster over 18 query--layout pairs.
+\end{abstract}
+
+% =========================================================================================
+\section{Introduction and research question}
+\label{sec:intro}
+
+The physical layout of a table decides which bytes a query has to move through the memory
+hierarchy. NSM stores each tuple contiguously, so any query reads whole tuples. DSM stores
+each attribute contiguously, so a query reads only the attributes it needs, but has to stitch
+them back together to produce tuples. PAX~\cite{pax} keeps NSM's page as the unit of storage
+but stores each attribute of the page in its own minipage, aiming for DSM's cache behaviour
+with NSM's locality for reconstruction.
+
+\paragraph{Research question.} \emph{How does the physical layout of a table, together with
+the way a query turns qualifying rows into output (the materialization strategy), affect the
+latency and cache behaviour of analytical queries, across projectivity, selectivity,
+working-set size and PAX page size? And given the cache hierarchy of one specific machine, how
+should the query code change to run faster there?}
+
+The crossovers we study are: projectivity (how many attributes before NSM beats DSM),
+selectivity (how many rows before early materialization beats late), the working-set size
+(whether the answers change when the table fits in cache) and the PAX page size (how large a
+page must be for PAX to scan like DSM). For the second half of the question we follow the
+project's suggestion and start with \emph{early versus late materialization}, which changes
+which cache lines are touched, and \emph{compression}, which changes how many values fit in
+one. We then extend it to the vector size, memory placement, output writes and page size.
+
+\paragraph{Outline.} \Cref{sec:design,sec:method} describe the engine and how we measured.
+\Cref{sec:results} reports the layout experiments and \cref{sec:analysis} explains them by
+counting cache lines. \Cref{sec:mat,sec:enc} apply the same count to materialization and to
+encodings, \cref{sec:tuning} turns the machine's parameters into tuning rules, and
+\cref{sec:tried} lists what we tried and dropped.
+
+% =========================================================================================
+\section{Design and implementation}
+\label{sec:design}
+
+\subsection{Data and layouts}
+
+A table has $R$ rows and $N$ attributes of type \code{int64\_t}, generated once from a seeded
+\code{std::mt19937\_64}. Unless stated otherwise, values are uniform in $[0, 10^6)$, so a
+predicate \code{c < x} can be given any selectivity in steps of $10^{-6}$. All layouts are built
+before any timing starts (\cref{fig:layouts}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=0.36cm,y=0.36cm,font=\scriptsize]
+  % NSM
+  \node[anchor=west] at (0,3.2) {\textbf{NSM}: one array, row-major};
+  \foreach \r in {0,...,3} \foreach \c in {0,...,3} {
+    \pgfmathtruncatemacro{\i}{\r*4+\c}
+    \fill[nsm!\the\numexpr 25+\c*20\relax] (\i,0) rectangle +(1,1.6);
+    \draw[white,line width=0.6pt] (\i,0) rectangle +(1,1.6);
+    \node at (\i+0.5,0.8) {\tiny\textcolor{white}{\r}};
+  }
+  \node[anchor=west] at (0,-0.7) {tuple $r$ at \code{r*N}; attributes of one tuple adjacent};
+  % DSM
+  \begin{scope}[xshift=7.2cm]
+  \node[anchor=west] at (0,3.2) {\textbf{DSM}: one array per attribute};
+  \foreach \c in {0,...,3} \foreach \r in {0,...,3} {
+    \fill[dsm!\the\numexpr 25+\c*20\relax] (\r+\c*4.6,0) rectangle +(1,1.6);
+    \draw[white,line width=0.6pt] (\r+\c*4.6,0) rectangle +(1,1.6);
+    \node at (\r+\c*4.6+0.5,0.8) {\tiny\textcolor{white}{\r}};
+  }
+  \node[anchor=west] at (0,-0.7) {column $c$ in its own allocation (start offset: \code{--dsm-offset})};
+  \end{scope}
+  % PAX
+  \begin{scope}[yshift=-2.6cm]
+  \node[anchor=west] at (0,3.2) {\textbf{PAX}: fixed-size pages; inside a page one minipage per attribute (+ optional padding)};
+  \foreach \p in {0,1} {
+    \draw[black!50] (\p*17.5-0.2,-0.2) rectangle +(17.2,2.0);
+    \node[anchor=south west] at (\p*17.5-0.2,1.8) {\tiny page \p};
+    \foreach \c in {0,...,3} {
+      \foreach \r in {0,1,2} {
+        \fill[pax!\the\numexpr 25+\c*20\relax] (\p*17.5+\c*4.2+\r,0) rectangle +(1,1.6);
+        \draw[white,line width=0.6pt] (\p*17.5+\c*4.2+\r,0) rectangle +(1,1.6);
+        \pgfmathtruncatemacro{\rr}{\p*3+\r}
+        \node at (\p*17.5+\c*4.2+\r+0.5,0.8) {\tiny\textcolor{white}{\rr}};
+      }
+      \fill[black!12] (\p*17.5+\c*4.2+3,0) rectangle +(0.9,1.6);
+    }
+  }
+  \end{scope}
+\end{tikzpicture}
+\caption{The three layouts for a table with 4 attributes (shades) and rows 0--5 (numbers).
+PAX keeps page boundaries explicit: rows never span pages, every page stores its own tuple
+count, and grey boxes mark the optional per-minipage padding.}
+\label{fig:layouts}
+\end{figure}
+
+\begin{description}
+\item[NSM] One row-major array of $R\cdot N$ values; attribute $c$ of row $r$ is at $rN + c$.
+\item[DSM] $N$ arrays of $R$ values, each in its own page-aligned anonymous \code{mmap}, so that
+the placement does not depend on the allocator. Column $c$ can start $c\cdot\delta$ bytes into
+its allocation (\code{--dsm-offset}), which matters for cache-set conflicts
+(\cref{sec:tuning:place}).
+\item[PAX] Pages of a fixed size $P$ (\code{--page-size}, default 16\,KB) back to back in one
+buffer. Inside a page, attribute $c$ occupies a contiguous \emph{minipage} holding that
+attribute for the page's rows: with $N{=}16$, a page holds $P/128$ rows and a minipage is
+$P/16$ bytes. Rows never cross pages, and no query reads across a page boundary.
+\end{description}
+With \code{--hugepages}, buffers of 2\,MB or more are 2\,MB-aligned and marked with
+\code{madvise(MADV\_HUGEPAGE)} before they are first touched, so transparent huge pages back
+them.
+
+\subsection{Queries}
+
+Two query classes cover what the project asks for.
+\textbf{Projection}, \code{SELECT c$_{i_1}$, \dots, c$_{i_k}$ FROM t WHERE \dots}, writes the
+qualifying tuples row-major into a preallocated output buffer, so every layout has to
+reconstruct tuples; with all $N$ attributes it is \code{SELECT *}. \textbf{Aggregation},
+\code{SELECT SUM(c$_{i_1}$)+\dots+SUM(c$_{i_k}$), COUNT(*)}, builds no tuples (AVG is SUM/COUNT).
+The WHERE clause is a conjunction of predicates $\textit{lo} \le c \le \textit{hi}$, which covers
+$=$, $<$, $>$ and ranges, and compiles to one unsigned comparison
+$(v-\textit{lo}) \le_u (\textit{hi}-\textit{lo})$. In the sweeps, \code{--sel s} generates
+\code{c0 < x} with $x$ chosen so that a fraction $s$ of the rows qualifies, and the query reads
+the first $k$ attributes, so the predicate column is one of them.
+
+\subsection{Execution: chunks, kernels and strategies}
+\label{sec:design:exec}
+
+A layout is presented to a query as a sequence of \emph{chunks} of at most $B$ rows (the vector
+size, default 1024): a base pointer and a stride for NSM, or one pointer per referenced
+attribute for DSM, a PAX page and a decoded vector. The kernels are templates over the chunk
+type, specialised at compile time on the number of output attributes and predicates. This
+matters: without it, the kernels reloaded every column pointer and predicate bound on every
+row, and DSM early at $k{=}2$ ran 54 instructions per row (23.5\ms) instead of 12 (2.6\ms),
+which hid every memory effect we wanted to measure. The strategies are:
+
+\begin{description}
+\item[early] Stitch, then filter. For each row, load all referenced attributes, write the
+output tuple unconditionally and advance the output cursor by the predicate's 0/1 result. No
+branch, and every referenced attribute of every row is read. Early SUM adds each row's
+attributes and masks the row sum with the predicate result.
+\begin{lstlisting}
+for (i = 0; i < n; ++i) { for (j = 0; j < m; ++j) out[cnt*m + j] = col[j][i];  cnt += pass(i); }
+\end{lstlisting}
+\item[early-pipe] Test the predicate first and fetch the other attributes only for
+qualifying rows, with one branch per row.
+\item[late] Build a \emph{selection vector} of qualifying positions from the first
+predicate without branches (further predicates refine it), then gather each output attribute
+at those positions, one attribute at a time. Late SUM sums one column at a time over the
+selection vector.
+\begin{lstlisting}
+for (i = 0; i < n; ++i) { sel[cnt] = i;  cnt += pass(i); }                           // select
+for (j = 0; j < m; ++j)  for (t = 0; t < cnt; ++t)  out[t*m + j] = col[j][sel[t]];   // gather
+\end{lstlisting}
+\item[late-branch] As \emph{late}, with a branch per row in the selection.
+\item[auto] Chooses \emph{early} or \emph{late} for every span of at least 1024 rows
+(\cref{sec:mat:auto}).
+\end{description}
+
+\subsection{Encodings}
+\label{sec:design:enc}
+
+DSM can store each column in one of seven encodings, in blocks of 1024 values: \emph{plain};
+\emph{bitpack} ($v-\min$ in the column's minimum bit width); \emph{for} (bitpack with a
+per-block minimum and width, whose block minimum and maximum also form a zone map);
+\emph{dict} (bit-packed codes into a sorted dictionary); \emph{dictb} (dict with codes of 1, 2 or
+4 bytes); \emph{rle} ((value, run end) pairs); and \emph{delta} (bit-packed zig-zag differences).
+Columns are read either one virtual call per value (\emph{value mode}, like a Volcano iterator)
+or one decoded vector at a time (\emph{vector mode}). In vector mode, late strategies push
+predicates into the compressed data (packed offsets compared against a translated bound, zone
+maps, dictionary code ranges, one test per run), and late SUM without a predicate works on the
+compressed form (\cref{sec:enc:compressed}). Early strategies decode each vector and run the
+plain kernel.
+
+\paragraph{Machine-aware knobs and correctness.} Every tuning knob is off by default, so the
+defaults are an untuned baseline, and each has an \code{auto} value derived from the cache
+parameters that \code{scan\_bench --machine} reads from sysfs (\cref{sec:tuning}). Before
+anything is timed, every configuration runs once on every layout and strategy and is compared
+with a naive row-at-a-time reference; a projection is checked with a position-weighted
+checksum, so a value in the wrong row or slot is caught.
+
+% =========================================================================================
+\section{Experimental methodology}
+\label{sec:method}
+
+\paragraph{Machine.} One laptop: an AMD Ryzen~5 5600H (Zen~3, up to 4.2\,GHz) under WSL2
+(Linux 6.18). Each core has a 32\,KB 8-way L1D (64 sets, so addresses 4\,KB apart share a
+set) and a 512\,KB L2; the six cores share a 16\,MB L3. Lines are 64 bytes, and the widest SIMD
+is AVX2 (no AVX-512). \Cref{tab:machine} gives what our microbenchmark measured on one core.
+Two numbers recur. DRAM delivers about $28/4.1 \approx 7$ bytes per cycle, so a scan of 8-byte
+values stays memory-bound only while it spends less than about 1.2 cycles per value. And a
+store that misses first reads the line (write-allocate), so writes to DRAM reach less than half
+of the read bandwidth.
+
+\begin{table}[t]
+\centering\small
+\caption{The memory hierarchy measured on one core (\code{build/membench}): load-to-use latency
+from a random pointer chase, bandwidth from sequential reads and writes.}
+\label{tab:machine}
+\gen{machine_table}
+\end{table}
+
+\paragraph{Procedure.}
+\begin{itemize}
+\item Only the query's \code{run()} is timed; tables, layouts, encodings and output buffers are
+built and touched before. Every run is pinned to one core (\code{taskset -c 2}).
+\item Each configuration gets 1 warm-up and 5 timed runs per round, over 3 rounds that
+interleave all configurations, so a slow period on the host (WSL2 shares the machine with
+Windows) affects all of them. We report medians.
+\item The default table has $R = 4\cdot 10^6$ rows and $N = 16$ attributes: 512\,MB per
+layout, 32 times the L3, so scans come from DRAM. When the table fits in a cache,
+\code{--min-time-ms} repeats the scan until a sample lasts 10--20\ms.
+\item DSM columns start 17 cache lines apart (\code{--dsm-offset auto}) in every experiment
+except those that study placement. Page-aligned columns make row-at-a-time access to more
+than 8 columns up to 3$\times$ slower (\cref{sec:tuning:place}), an artifact of allocation
+that would distort every layout comparison.
+\item \code{--perf} reads hardware counters (cycles, instructions, L1D accesses and misses,
+dTLB misses) with \code{perf\_event\_open} around each timed run. WSL2 leaves five of Zen~3's
+six counters free, so groups have at most five events. We report counters per table row.
+\end{itemize}
+
+\paragraph{Experiments.} \Cref{tab:experiments} lists them. Each is a list of
+\code{scan\_bench} invocations in \code{scripts/experiments.py}, and \code{scripts/figures.py}
+regenerates every figure and generated table in this report from the CSVs in \code{results/}.
+
+\begin{table}[t]
+\centering\small
+\caption{Experiments. Unless noted: $R{=}4\mathrm{M}$, $N{=}16$, uniform data, PAX pages of
+16\,KB, vectors of 1024 rows, DSM columns staggered by 17 lines, other knobs off.}
+\label{tab:experiments}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Experiment & What varies \\
+\midrule
+projectivity & $k \in \{1,2,4,8,16\}$, no predicate; SUM and projection \\
+selectivity & $s$ from 0.01\% to 100\%; projection $k\in\{2,4,16\}$ and SUM $k{=}4$; all fixed strategies; also with the table in L3 \\
+width, working set & $N$ from 2 to 256 at 512\,MB; table size from 16\,KB to 512\,MB \\
+PAX page & page size from 1\,KB to 4\,MB; plain, padded or odd-line minipages \\
+encodings & every encoding $\times$ 5 distributions, $N{=}8$; predicates on compressed data; dictionary codes; working set; scalar and AVX2 \\
+materialization & late's cost per column and per gathered line; SIMD selection from DRAM, L3, L2; auto vs early and late \\
+tuning & vector size; DSM offsets and huge pages; output writes; untuned vs tuned \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% =========================================================================================
+\section{Results: layouts}
+\label{sec:results}
+
+\input{results.tex}
+
+% =========================================================================================
+\section{Analysis: counting cache lines}
+\label{sec:analysis}
+
+\input{analysis.tex}
+
+% =========================================================================================
+\section{Early or late materialization}
+\label{sec:mat}
+
+\input{materialization.tex}
+
+% =========================================================================================
+\section{Encodings}
+\label{sec:enc}
+
+\input{encodings.tex}
+
+% =========================================================================================
+\section{Tuning for this machine}
+\label{sec:tuning}
+
+\input{tuning.tex}
+
+% =========================================================================================
+\section{Tried and dropped}
+\label{sec:tried}
+
+\input{tried.tex}
+
+% =========================================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+
+\input{conclusions.tex}
+
+\begin{thebibliography}{9}
+\bibitem{pax} A.~Ailamaki, D.~J.~DeWitt, M.~D.~Hill, M.~Skounakis.
+\newblock Weaving relations for cache performance.
+\newblock In \emph{VLDB}, 2001.
+\bibitem{abadi} D.~J.~Abadi, D.~S.~Myers, D.~J.~DeWitt, S.~R.~Madden.
+\newblock Materialization strategies in a column-oriented DBMS.
+\newblock In \emph{ICDE}, 2007.
+\bibitem{x100} P.~Boncz, M.~Zukowski, N.~Nes.
+\newblock MonetDB/X100: Hyper-pipelining query execution.
+\newblock In \emph{CIDR}, 2005.
+\bibitem{lemire} D.~Lemire, L.~Boytsov.
+\newblock Decoding billions of integers per second through vectorization.
+\newblock \emph{Software: Practice and Experience}, 45(1), 2015.
+\end{thebibliography}
+
+\end{document}

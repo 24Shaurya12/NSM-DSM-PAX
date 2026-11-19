@@ -1,0 +1,11 @@
+taskset -c 2 /home/shaurya/repos/COL868/build/scan_bench --rows 4194304 --cols 16 --domain 1000000 --iters 5 --rounds 3 --warmup 1 --dsm-offset auto --query sum,projection --k 1,4,16 --strategy early,late --min-time-ms 20 --page-size 16384 --output /home/shaurya/repos/COL868/results/workingset/ws_524288k.csv.tmp
+CPU: AMD Ryzen 5 5600H with Radeon Graphics
+  L1D: 32 KB, 8-way, 64 B lines, 64 sets (same-set stride 4 KB)
+  L2: 512 KB, 8-way, 64 B lines, 1024 sets (same-set stride 64 KB)
+  L3: 16 MB, 16-way, 64 B lines, 16384 sets (same-set stride 1 MB)
+  page size 4 KB, transparent huge pages: madvise
+Table: 4194304 rows x 16 cols, 512 MB of data, uniform distribution, DSM column offset step 1088 B
+  NSM footprint: 512 MB
+  DSM footprint: 512 MB
+  PAX footprint: 512 MB (page 16384 B, 128 tuples/page)
+Correctness check passed for 6 configurations

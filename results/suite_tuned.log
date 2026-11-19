@@ -1,0 +1,14 @@
+[15:11:43] tuned
+  done untuned_sum_k1 (3s)
+  done tuned_sum_k1 (2s)
+  done untuned_sum_k16 (5s)
+  done tuned_sum_k16 (5s)
+  done untuned_proj_k16 (14s)
+  done tuned_proj_k16 (9s)
+  done untuned_proj_k4_s1 (6s)
+  done tuned_proj_k4_s1 (3s)
+  done untuned_proj_k16_s10 (14s)
+  done tuned_proj_k16_s10 (8s)
+  done untuned_proj_k16_s50 (20s)
+  done tuned_proj_k16_s50 (9s)
+exit 0

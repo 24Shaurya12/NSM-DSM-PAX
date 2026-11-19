@@ -1,0 +1,39 @@
+On one core of this laptop, every result reduces to the cache lines a query moves from the
+level of the hierarchy the data lives in, and to what the CPU does with each line.
+
+\paragraph{Layouts.} DSM wins whenever a query reads few attributes or produces few rows: up to
+15$\times$ over NSM for one attribute of 16, and up to 9$\times$ over its own early strategy for
+\code{SELECT *} at 0.01\%. NSM wins the reconstruction of many attributes over many rows,
+because its reconstruction is a copy, and it is the least sensitive to strategy, width and
+placement. PAX matches DSM only with large pages: with the 8--16\,KB pages of disk-based PAX its
+minipages are too short for the prefetcher, and from 64\,KB on they alias in L1 unless their
+stride is an odd number of lines. Where the data lives moves the strategy crossovers by an order
+of magnitude, while the layout ranking stays the same.
+
+\paragraph{Materialization.} Late reads, of every attribute it gathers, the fraction
+$1-(1-s)^v$ of lines holding a selected value, and each gathered line costs 2.2--3.2 streamed
+ones from DRAM. It wins below 2.4\% (4 attributes) to 7.4\% (16) from DRAM, and up to 20--33\%
+for projections in L3, where gathered lines are cheap; in cache the CPU work per row decides,
+and late SUM wins only with a hand-written SIMD selection vector. A threshold from the line size
+and two fitted constants, chosen by where the table lives, picks between them per span and beats
+both fixed strategies on clustered data.
+
+\paragraph{Encodings.} Fewer bytes alone do not make a scan faster: decoding first was slower
+than plain for every encoding, even rle with 32$\times$ fewer bytes. Compression wins when the
+query works on the compressed form (SUM over runs 87$\times$, SUM from deltas 1.3$\times$, zone
+maps up to 15$\times$ over late on plain, byte-aligned dictionary codes 2.2--5.4$\times$).
+Otherwise it wins only if decoding costs less than the time memory takes per plain value, about
+1 cycle from DRAM and 0.3 in cache: here that requires AVX2, and only pays from DRAM.
+
+\paragraph{Tuning.} One hardware parameter decides one code choice: the line size and where the
+data lives decide the materialization threshold, the cache sizes and the work per value decide
+the vector size, the L1 set stride decides where columns and minipages start, write-allocate
+decides how output is written, the prefetcher and the TLB decide the PAX and OS page sizes, and
+the SIMD width and DRAM bandwidth decide the kernels and the code width. Together they make the
+engine 1.46$\times$ faster over 18 query--layout pairs, up to 3.8$\times$, without changing the
+queries.
+
+\paragraph{Limitations.} All results come from one core of one laptop under WSL2, with 8-byte
+integer attributes. The rules use parameters that sysfs reports, but the constants of the
+threshold were fitted here, and the size of each effect depends on this machine; on another
+machine they should be measured again with \code{make experiments}.

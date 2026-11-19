@@ -1,0 +1,23 @@
+taskset -c 2 /home/shaurya/repos/COL868/build/scan_bench --rows 4000000 --cols 8 --domain 100 --iters 5 --rounds 3 --warmup 1 --dsm-offset auto --dist wide --layout dsm --encoding all --query sum,projection --k 8 --strategy early,late --output /home/shaurya/repos/COL868/results/encodings/enc_wide.csv.tmp
+CPU: AMD Ryzen 5 5600H with Radeon Graphics
+  L1D: 32 KB, 8-way, 64 B lines, 64 sets (same-set stride 4 KB)
+  L2: 512 KB, 8-way, 64 B lines, 1024 sets (same-set stride 64 KB)
+  L3: 16 MB, 16-way, 64 B lines, 16384 sets (same-set stride 1 MB)
+  page size 4 KB, transparent huge pages: madvise
+Table: 4000000 rows x 8 cols, 244.141 MB of data, wide distribution, DSM column offset step 1088 B
+  DSM footprint: 244.141 MB
+  DSM-plain-value footprint: 244.141 MB
+  DSM-plain-vector footprint: 244.141 MB
+  DSM-bitpack-value footprint: 244.141 MB
+  DSM-bitpack-vector footprint: 244.141 MB
+  DSM-for-value footprint: 244.767 MB
+  DSM-for-vector footprint: 244.767 MB
+  DSM-dict-value footprint: 328.064 MB
+  DSM-dict-vector footprint: 328.064 MB
+  DSM-dictb-value footprint: 366.211 MB
+  DSM-dictb-vector footprint: 366.211 MB
+  DSM-rle-value footprint: 488.281 MB
+  DSM-rle-vector footprint: 488.281 MB
+  DSM-delta-value footprint: 244.528 MB
+  DSM-delta-vector footprint: 244.528 MB
+Correctness check passed for 2 configurations

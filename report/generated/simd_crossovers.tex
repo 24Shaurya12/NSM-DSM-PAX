@@ -1,0 +1,12 @@
+\begin{tabular}{llrr}
+\toprule
+Data in & Query & late vs early & late (AVX2) vs early \\
+\midrule
+DRAM & SUM & 1.2\% & 2.7\% \\
+DRAM & SELECT & 2\% & 2.9\% \\
+L3 & SUM & $<$ 0.011\% & 3.4\% \\
+L3 & SELECT & 19\% & 37\% \\
+L2 & SUM & $<$ 0.098\% & 5.8\% \\
+L2 & SELECT & 24\% & 48\% \\
+\bottomrule
+\end{tabular}

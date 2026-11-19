@@ -1,0 +1,2019 @@
+diff --git a/Makefile b/Makefile
+index 38ba0e9..3a17f41 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@ CXX      ?= g++
+ CXXFLAGS ?= -std=c++17 -O2 -march=native -Wall -Wextra -Wpedantic
+ CPPFLAGS += -Isrc
+ 
+-SRCS := $(wildcard src/*.cpp src/queries/*.cpp)
++SRCS := $(wildcard src/*.cpp src/queries/*.cpp src/encodings/*.cpp)
+ OBJS := $(SRCS:src/%.cpp=build/%.o)
+ DEPS := $(OBJS:.o=.d)
+ BIN  := build/scan_bench
+@@ -32,6 +32,17 @@ PERF_WORDS := perf PERF Perf
+ PERF_SET   := $(or $(perf),$(if $(filter $(PERF_WORDS),$(MAKECMDGOALS)),core))
+ PERF_FLAGS := $(if $(PERF_SET),--perf $(PERF_SET))
+ 
++# Encodings (DSM only) and data:
++#   enc=all | enc=dict,rle   also run DSM with every column encoded (plain bitpack for dict rle delta)
++#   mode=value | mode=vector scan mode for encoded layouts (default both)
++#   dist=sorted              data distribution: uniform (default) wide sorted runs zipf
++#   layout=dsm,nsm,pax|none  uncompressed layouts to run; defaults to all, or to dsm when enc= is set
++LAYOUT_SEL := $(or $(layout),$(if $(enc),dsm))
++DATA_FLAGS := $(if $(enc),--encoding $(enc)) $(if $(mode),--mode $(mode)) \
++              $(if $(dist),--dist $(dist)) $(if $(LAYOUT_SEL),--layout $(LAYOUT_SEL))
++# Graph file suffix, so encoded / non-uniform runs don't overwrite the plain graphs.
++GRAPH_SUFFIX := $(if $(enc),_enc)$(if $(dist),_$(dist))
++
+ all: $(BIN)
+ 
+ $(BIN): $(OBJS)
+@@ -42,31 +53,54 @@ build/%.o: src/%.cpp
+ 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+ 
+ test: $(BIN)
+-	./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --k 1,$(TEST_COLS) $(QUERY_FLAGS) $(PERF_FLAGS) \
++	./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --k 1,$(TEST_COLS) $(QUERY_FLAGS) $(PERF_FLAGS) $(DATA_FLAGS) \
+ 		| python3 scripts/summarize.py
+ 
+ # Graphs: every k (1, 2, 4, ..., N) for every layout. Query qN is written to
+ # output/qN/graph_qN.csv and output/qN/graph_qN.png (graph_qN_log.png with `log`).
++# With enc= / dist=, the name gets _enc / _<dist>, e.g. output/q1/graph_q1_enc_sorted.png.
+ # With `perf`, each counter metric also gets its own output/qN/graph_qN_<metric>.png.
+ VENV := .venv
+ 
+ define GRAPH_ONE
+ mkdir -p output/$(1)
+-./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --query $(QUERY_$(1)) $(PERF_FLAGS) --output output/$(1)/graph_$(1).csv
+-$(VENV)/bin/python scripts/plot.py output/$(1)/graph_$(1).csv output/$(1)/graph_$(1) $(if $(LOGY),--logy)
++./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --query $(QUERY_$(1)) $(PERF_FLAGS) $(DATA_FLAGS) --output output/$(1)/graph_$(1)$(GRAPH_SUFFIX).csv
++$(VENV)/bin/python scripts/plot.py output/$(1)/graph_$(1)$(GRAPH_SUFFIX).csv output/$(1)/graph_$(1)$(GRAPH_SUFFIX) $(if $(LOGY),--logy)
+ 
+ endef
+ 
+ graph: $(BIN) $(VENV)/.installed
+ 	$(foreach q,$(RUN_IDS),$(call GRAPH_ONE,$(q)))
+ 
++# `make encodings q1`: for every data distribution, run uncompressed DSM plus every
++# encoding over every k, plot latency vs k (output/qN/graph_qN_enc_<dist>.png), then
++# summarise compression ratio and speedup at k = N per distribution and encoding in
++# output/qN/encodings_qN.{png,csv}. Honours mode=, perf, log, TEST_ROWS and TEST_COLS.
++DISTS := uniform wide sorted runs zipf
++
++define ENC_ONE
++mkdir -p output/$(1)
++./$(BIN) --rows $(TEST_ROWS) --cols $(TEST_COLS) --query $(QUERY_$(1)) $(PERF_FLAGS) --encoding all --layout dsm $(if $(mode),--mode $(mode)) --dist $(2) --output output/$(1)/graph_$(1)_enc_$(2).csv
++$(VENV)/bin/python scripts/plot.py output/$(1)/graph_$(1)_enc_$(2).csv output/$(1)/graph_$(1)_enc_$(2) $(if $(LOGY),--logy)
++
++endef
++
++define ENC_QUERY
++$(foreach d,$(DISTS),$(call ENC_ONE,$(1),$(d)))
++$(VENV)/bin/python scripts/compare_encodings.py output/$(1)/encodings_$(1) $(foreach d,$(DISTS),output/$(1)/graph_$(1)_enc_$(d).csv)
++
++endef
++
++encodings: $(BIN) $(VENV)/.installed
++	$(foreach q,$(RUN_IDS),$(call ENC_QUERY,$(q)))
++
+ $(VENV)/.installed: requirements.txt
+ 	python3 -m venv $(VENV)
+ 	$(VENV)/bin/pip install -q -r requirements.txt
+ 	touch $@
+ 
+ # Selectors and `log` are modifiers for test/graph; on their own (`make q1`) they run the test.
+-$(SELECTORS) $(LOG_WORDS) $(PERF_WORDS): $(if $(filter test graph,$(MAKECMDGOALS)),,test)
++$(SELECTORS) $(LOG_WORDS) $(PERF_WORDS): $(if $(filter test graph encodings,$(MAKECMDGOALS)),,test)
+ 	@:
+ 
+ clean:
+@@ -74,4 +108,4 @@ clean:
+ 
+ -include $(DEPS)
+ 
+-.PHONY: all test graph clean $(SELECTORS) $(LOG_WORDS) $(PERF_WORDS) q1 Q1 q2 Q2
++.PHONY: all test graph encodings clean $(SELECTORS) $(LOG_WORDS) $(PERF_WORDS) q1 Q1 q2 Q2
+diff --git a/README.md b/README.md
+index 527599b..7cc818b 100644
+--- a/README.md
++++ b/README.md
+@@ -14,8 +14,11 @@ A small in-memory benchmark that compares three physical layouts of the same
+ | DSM | `N` separate arrays of `R` values, one per column. |
+ | PAX | Fixed-size pages, each holding `floor(page_size / (N*8))` tuples. Inside a page, every column has its own contiguous minipage. The tuple count is stored per page, since the last page may be partial. |
+ 
+-All buffers are 64-byte aligned. Data is uniform in `[0, 100)` from
++DSM can also be run with every column compressed (see [Encodings](#encodings-dsm-only)).
++
++All buffers are 64-byte aligned. By default, data is uniform in `[0, 100)` from
+ `std::mt19937_64` with a fixed seed (42), so every run produces the same table.
++`--dist` picks another distribution.
+ 
+ ## Layout of the code
+ 
+@@ -26,6 +29,10 @@ src/layout.h           common Layout interface (storage only, plus run(Query&))
+ src/nsm.{h,cpp}        NSM layout
+ src/dsm.{h,cpp}        DSM layout
+ src/pax.{h,cpp}        PAX layout
++src/encoded_dsm.{h,cpp}  DSM with encoded columns, read in value or vector mode
++src/encodings/encoded_column.*  EncodedColumn / ColumnCursor interfaces + encoding registry
++src/encodings/bits.*   bit-packing helpers (pack, extract one value, unrolled unpack)
++src/encodings/<name>.cpp  one encoding each: plain bitpack for dict rle delta
+ src/query.h            Query interface: one run() overload per layout, plus result()
+ src/queries/sum.*      SUM query
+ src/queries/projection.*  projection query
+@@ -101,6 +108,77 @@ group that doesn't fit is never scheduled at all. The program exits with an
+ error in that case instead of reporting zeros. `mem` and `stall` use raw AMD
+ event codes and refuse to run on other CPUs.
+ 
++## Encodings (DSM only)
++
++`--encoding` adds DSM layouts whose columns are each stored in one encoding.
++Only the column store gets encodings: NSM and PAX stay uncompressed as reference
++points. Each encoding is run in two scan modes, so `--encoding dict` adds two
++layouts, `DSM-dict-value` and `DSM-dict-vector`. Both share one encoded copy of
++the data.
++
++| Encoding | Storage | Compresses well when |
++|----------|---------|----------------------|
++| `plain` | The `int64` array, same as DSM | Never. Measures the cost of the scan machinery alone, with no decoding. |
++| `bitpack` | `v - min(column)` in `w` bits, where `w` covers the whole column's range | The whole column has a narrow range |
++| `for` | Frame of reference: like `bitpack`, but each block of 1024 values has its own min and width | Each block has a narrow range (e.g. sorted data) |
++| `dict` | Sorted distinct values + a bit-packed code per row | There are few distinct values, however large or spread out |
++| `rle` | One (value, run end) pair per run of equal values | Values repeat in long runs |
++| `delta` | Per block of 1024: the first value + zigzag-encoded, bit-packed differences between neighbours | Neighbouring values are close (e.g. sorted data) |
++
++| Mode | How a query reads a column |
++|------|----------------------------|
++| `value` | One virtual `ColumnCursor::next()` call per value, like a tuple-at-a-time (Volcano) operator that doesn't know the encoding at compile time. |
++| `vector` | One virtual `EncodedColumn::decode()` call per 1024 values into a buffer, then a tight loop over the buffer. Bit-unpacking uses a kernel unrolled for each width from 0 to 64. |
++
++Each query implements both modes in its own file. `projection` in vector mode
++decodes one column's batch and scatters it into that column of the batch's
++output rows. The CSV's `footprint_bytes` column, and `size_MB` / `ratio` in
++`make test`, report the compressed size.
++
++To make the encodings meaningful, `--dist` generates each column independently:
++
++| `--dist` | Data | Favours |
++|----------|------|---------|
++| `uniform` (default) | uniform in `[0, 100)`; 7 bits | `bitpack`, `for`, `dict` |
++| `wide` | uniform over all of `int64` | nothing; shows what each encoding costs when it can't compress |
++| `sorted` | increasing; each value = previous + uniform `[0, 8)` | `delta`, then `for` |
++| `runs` | runs of one value in `[0, 2^20)`, lengths uniform in `[1, 2L-1]` (`--run-length L`, default 64) | `rle` |
++| `zipf` | Zipf (s = 1) over 10,000 distinct values, each a full-range `int64` | `dict` |
++
++`sum` accumulates modulo 2^64 (unsigned), so `wide` and `zipf` data can't
++overflow it.
++
++```
++make test q1 enc=all                # every encoding, both modes, plus uncompressed DSM
++make test q1 enc=dict,rle dist=runs
++make graph q1 enc=all dist=sorted   # -> output/q1/graph_q1_enc_sorted.png
++make graph q2 enc=all mode=vector   # vector mode only
++make test enc=all layout=nsm,dsm,pax  # also include NSM and PAX
++```
++
++`make encodings` runs everything at once. For each selected query and each
++distribution, it runs uncompressed DSM plus every encoding over every k and
++draws `output/qN/graph_qN_enc_<dist>.png`. It then summarises the runs in
++`output/qN/encodings_qN.png` and the encoded sizes in `output/qN/encodings_qN_size.png`
++(with the exact numbers in `encodings_qN.csv`), at
++k = N: the compression ratio, and the speedup over uncompressed DSM in each scan
++mode, per distribution and encoding. Bars above 1× mean better than
++uncompressed DSM.
++
++```
++make encodings TEST_ROWS=1000000 TEST_COLS=16   # both queries, ~3 minutes
++make encodings q1 mode=vector
++```
++
++Memory: every encoding keeps its own copy of the table. With the default
++100K × 512 table (390 MB) and `wide` data, that's about 3.6 GB in total, so on a
++machine with little RAM use fewer rows or columns.
++
++With `enc=`, `make` runs only uncompressed DSM as the baseline unless you pass
++`layout=`. In graphs, colour marks the encoding and line style the mode
++(solid = vector, dashed = value). With more than four series, the min–max bands
++are left out.
++
+ ## Flags
+ 
+ | Flag | Default | Meaning |
+@@ -111,10 +189,17 @@ event codes and refuse to run on other CPUs.
+ | `--k K1,K2,...` | `1,2,4,...,N` | values of `k` (number of leading columns each query reads); `N` is always included in the default |
+ | `--query Q1,Q2` | all | queries to run (`sum`, `projection`) |
+ | `--output FILE` | stdout | where to write the CSV |
++| `--perf SET` | none | also record hardware counters (`core`, `mem`, `stall`) |
++| `--dist D` | `uniform` | data distribution: `uniform`, `wide`, `sorted`, `runs`, `zipf` |
++| `--run-length L` | 64 | mean run length for `--dist runs` |
++| `--layout L1,L2` | all | uncompressed layouts to run: `nsm`, `dsm`, `pax`, or `none` |
++| `--encoding E1,E2` | none | also run DSM with encoded columns: `all`, or any of `plain`, `bitpack`, `for`, `dict`, `rle`, `delta` |
++| `--mode M1,M2` | both | scan modes for encoded layouts: `value`, `vector` |
+ 
+ ## What a run does
+ 
+-1. Generates the table and builds all three layouts. This step is not timed.
++1. Generates the table and builds the selected layouts (and encodes the
++   columns, for encoded layouts). This step is not timed.
+ 2. Prints the table size in MB, and each layout's actual footprint, to stderr.
+ 3. Checks that all layouts produce the same `result()` for every query and
+    `k`, using a fresh query object per layout. If any differ, it prints the
+@@ -129,26 +214,28 @@ event codes and refuse to run on other CPUs.
+ It writes one CSV row per timed scan:
+ 
+ ```
+-query,layout,rows,cols,k,page_size,iteration,latency_ns,result
++query,layout,dist,rows,cols,k,page_size,footprint_bytes,iteration,latency_ns,result
+ ```
+ 
+-`page_size` is `0` for NSM and DSM because they have no pages.
++`page_size` is `0` for every layout except PAX. `footprint_bytes` is the
++layout's actual size in memory (the compressed size for encoded layouts).
+ 
+ ## Example
+ 
+ ```
+ $ ./build/scan_bench --rows 1000000 --cols 16 --output results.csv
+-Table: 1000000 rows x 16 cols, 122.07 MB of data
++Table: 1000000 rows x 16 cols, 122.07 MB of data, uniform distribution
+   NSM footprint: 122.07 MB
+   DSM footprint: 122.07 MB
+   PAX footprint: 122.078 MB
+ Correctness check passed for queries {sum,projection}, k in {1,2,4,8,16}
+ 
+ $ head -3 results.csv
+-query,layout,rows,cols,k,page_size,iteration,latency_ns,result
+-sum,NSM,1000000,16,1,0,0,4064834,49484225
+-sum,NSM,1000000,16,1,0,1,3789312,49484225
++query,layout,dist,rows,cols,k,page_size,footprint_bytes,iteration,latency_ns,result
++sum,NSM,uniform,1000000,16,1,0,128000000,0,6655101,49484225
++sum,NSM,uniform,1000000,16,1,0,128000000,1,6166144,49484225
+ ```
+ 
+ Note: while the layouts are being built, the logical table and all three
+-layouts are in memory at once, which is about 4× the table size.
++layouts are in memory at once, which is about 4× the table size. Each encoding
++adds its compressed size on top of that.
+diff --git a/scripts/compare_encodings.py b/scripts/compare_encodings.py
+new file mode 100644
+index 0000000..5ab7d7c
+--- /dev/null
++++ b/scripts/compare_encodings.py
+@@ -0,0 +1,251 @@
++#!/usr/bin/env python3
++"""Summarise encoded-DSM runs across data distributions into one figure.
++
++Usage: compare_encodings.py OUT_STEM RESULTS.csv [RESULTS.csv ...]
++
++Each RESULTS.csv is one `scan_bench --encoding ... --layout dsm --dist D` run of a single
++query (one per distribution). For every distribution and encoding, at k = N (all
++columns read), it compares against uncompressed DSM:
++  compression ratio  DSM footprint / encoded footprint
++  speedup            DSM median latency / encoded median latency, per scan mode
++Writes OUT_STEM.png (three panels: compression, vector-mode speedup, value-mode speedup;
++bars grow up or down from 1x on a log scale), OUT_STEM_size.png (encoded size in MB per
++distribution and encoding, against uncompressed DSM) and OUT_STEM.csv with the numbers.
++"""
++import csv
++import statistics
++import sys
++from collections import defaultdict
++
++import matplotlib
++
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt  # noqa: E402
++from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator  # noqa: E402
++
++from plot import ENCODING_COLORS, GRID, MUTED, SURFACE, TEXT  # noqa: E402
++
++DIST_ORDER = ["uniform", "wide", "sorted", "runs", "zipf"]
++MODES = ["vector", "value"]
++
++
++def load(path):
++    """Returns (dist, query, rows, cols, {layout: (median_ns, footprint_bytes)}) at k = N."""
++    lat = defaultdict(list)
++    footprint = {}
++    with open(path) as f:
++        rows = list(csv.DictReader(f))
++    if not rows:
++        sys.exit(f"compare_encodings.py: {path} is empty")
++    cols = int(rows[0]["cols"])
++    for r in rows:
++        if int(r["k"]) != cols:
++            continue
++        lat[r["layout"]].append(int(r["latency_ns"]))
++        footprint[r["layout"]] = int(r["footprint_bytes"])
++    if "DSM" not in lat:
++        sys.exit(f"compare_encodings.py: {path} has no uncompressed DSM run at k = {cols}; "
++                 "run scan_bench with --layout dsm")
++    stats = {l: (statistics.median(v), footprint[l]) for l, v in lat.items()}
++    return rows[0]["dist"], rows[0]["query"], int(rows[0]["rows"]), cols, stats
++
++
++def compute(paths):
++    """Returns (query, rows, cols, dists, table) where table[(dist, enc)] is a dict of
++    ratio and speedup_<mode>."""
++    table = {}
++    dists, meta = [], set()
++    for path in paths:
++        dist, query, rows, cols, stats = load(path)
++        meta.add((query, rows, cols))
++        dists.append(dist)
++        base_ns, base_bytes = stats["DSM"]
++        for enc in ENCODING_COLORS:
++            entry = {}
++            for mode in MODES:
++                layout = f"DSM-{enc}-{mode}"
++                if layout in stats:
++                    ns, nbytes = stats[layout]
++                    entry["ratio"] = base_bytes / nbytes
++                    entry["mb"] = nbytes / 2**20
++                    entry[f"speedup_{mode}"] = base_ns / ns
++            if entry:
++                table[(dist, enc)] = entry
++    if len(meta) != 1:
++        sys.exit(f"compare_encodings.py: inputs mix queries or table sizes: {sorted(meta)}")
++    dists.sort(key=lambda d: DIST_ORDER.index(d) if d in DIST_ORDER else len(DIST_ORDER))
++    query, rows, cols = meta.pop()
++    return query, rows, cols, dists, table
++
++
++def log_ticks(lo, hi):
++    """1-2-5 ticks covering [lo, hi], always including 1."""
++    ticks = []
++    for exp in range(-4, 5):
++        for m in (1, 2, 5):
++            ticks.append(m * 10.0 ** exp)
++    return [t for t in ticks if lo <= t <= hi]
++
++
++def fmt_x(v, _):
++    return f"{v:g}×"
++
++
++def bar_panel(ax, dists, encs, values, title, ylim):
++    """Grouped bars per distribution, each growing from 1x to its value."""
++    n = len(encs)
++    slot = 0.8 / n
++    width = slot * 0.82  # leftover is the surface gap between neighbouring bars
++    for i, enc in enumerate(encs):
++        xs, heights, bottoms = [], [], []
++        for d_i, dist in enumerate(dists):
++            v = values.get((dist, enc))
++            if v is None:
++                continue
++            xs.append(d_i - 0.4 + slot * (i + 0.5))
++            bottoms.append(min(1.0, v))
++            heights.append(abs(v - 1.0) if v != 1.0 else 0.0)
++        ax.bar(xs, heights, bottom=bottoms, width=width, color=ENCODING_COLORS[enc],
++               label=enc, linewidth=0)
++    ax.axhline(1.0, color=TEXT, linewidth=1)
++    ax.set_yscale("log")
++    ax.set_ylim(*ylim)
++    ax.yaxis.set_major_locator(FixedLocator(log_ticks(*ylim)))
++    ax.yaxis.set_major_formatter(FuncFormatter(fmt_x))
++    ax.yaxis.set_minor_locator(NullLocator())
++    ax.set_xticks(range(len(dists)), dists)
++    ax.set_xlim(-0.5, len(dists) - 0.5)
++    ax.set_title(title, loc="left", color=TEXT, fontsize=10, fontweight="bold")
++    ax.set_facecolor(SURFACE)
++    ax.grid(axis="y", color=GRID, linewidth=0.8)
++    ax.set_axisbelow(True)
++    for side in ("top", "right"):
++        ax.spines[side].set_visible(False)
++    for side in ("left", "bottom"):
++        ax.spines[side].set_color(GRID)
++    ax.tick_params(colors=MUTED, labelcolor=TEXT)
++
++
++def size_chart(path, query, rows, cols, dists, encs, table):
++    """Grouped bars of encoded size (MB) from 0, with uncompressed DSM as a reference line.
++    The smallest encoding in each distribution gets a value label. plain is left out: it
++    is uncompressed by definition, so it would only repeat the reference line."""
++    base_mb = rows * cols * 8 / 2**20
++    encs = [e for e in encs if e != "plain"]
++    fig, ax = plt.subplots(figsize=(9, 4.6), dpi=150)
++    fig.patch.set_facecolor(SURFACE)
++    ax.set_facecolor(SURFACE)
++    n = len(encs)
++    slot = 0.8 / n
++    width = slot * 0.82
++    for i, enc in enumerate(encs):
++        xs, mbs = [], []
++        for d_i, dist in enumerate(dists):
++            e = table.get((dist, enc))
++            if e and "mb" in e:
++                xs.append(d_i - 0.4 + slot * (i + 0.5))
++                mbs.append(e["mb"])
++        ax.bar(xs, mbs, width=width, color=ENCODING_COLORS[enc], label=enc, linewidth=0)
++    for d_i, dist in enumerate(dists):
++        sizes = [(table[(dist, e)]["mb"], i) for i, e in enumerate(encs) if (dist, e) in table]
++        mb, i = min(sizes)
++        if mb > base_mb * 0.99:  # nothing beats uncompressed: say so instead of a tie value
++            ax.annotate("no gain", (d_i, max(m for m, _ in sizes)), xytext=(0, 3),
++                        textcoords="offset points", ha="center", va="bottom", color=MUTED,
++                        fontsize=8)
++        else:
++            ax.annotate(f"{mb:.1f}", (d_i - 0.4 + slot * (i + 0.5), mb), xytext=(0, 3),
++                        textcoords="offset points", ha="center", va="bottom", color=TEXT,
++                        fontsize=8)
++    ax.axhline(base_mb, color=TEXT, linewidth=1, linestyle=(0, (4, 3)))
++    ax.text(len(dists) - 0.5, base_mb, f" uncompressed DSM\n {base_mb:.0f} MB", va="center",
++            ha="left", color=TEXT, fontsize=8)
++    tallest = max(e["mb"] for (_, enc), e in table.items() if enc in encs and "mb" in e)
++    ax.set_ylim(0, max(tallest, base_mb) * 1.1)  # headroom for the value labels
++    ax.set_ylabel("encoded size (MB)", color=TEXT)
++    ax.set_xticks(range(len(dists)), dists)
++    ax.set_xlim(-0.5, len(dists) - 0.5)
++    ax.grid(axis="y", color=GRID, linewidth=0.8)
++    ax.set_axisbelow(True)
++    for side in ("top", "right"):
++        ax.spines[side].set_visible(False)
++    for side in ("left", "bottom"):
++        ax.spines[side].set_color(GRID)
++    ax.tick_params(colors=MUTED, labelcolor=TEXT)
++
++    height = fig.get_figheight()
++    y = lambda inches: 1 - inches / height
++    fig.text(0.01, y(0.15), "Encoded size per data distribution", ha="left",
++             va="top", color=TEXT, fontsize=12, fontweight="bold")
++    fig.text(0.01, y(0.45), f"{rows:,} rows × {cols} int64 columns; all {cols} columns, "
++             "labels mark the smallest encoding per distribution", ha="left", va="top",
++             color=MUTED, fontsize=9)
++    fig.legend(*ax.get_legend_handles_labels(), loc="upper left", ncol=n, frameon=False,
++               labelcolor=TEXT, fontsize=9, bbox_to_anchor=(0.0, y(0.62)))
++    fig.tight_layout(rect=(0, 0, 0.9, y(1.0)))
++    fig.savefig(path, facecolor=SURFACE)
++    plt.close(fig)
++    print(f"wrote {path}")
++
++
++def padded_limits(vals):
++    lo, hi = min(vals + [1.0]), max(vals + [1.0])
++    return lo / 1.5, hi * 1.5
++
++
++def main():
++    if len(sys.argv) < 3:
++        sys.exit(__doc__)
++    stem, paths = sys.argv[1], sys.argv[2:]
++    query, rows, cols, dists, table = compute(paths)
++    encs = [e for e in ENCODING_COLORS if any((d, e) in table for d in dists)]
++
++    # Table view: the exact numbers behind the bars.
++    with open(f"{stem}.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["dist", "encoding", "size_MB", "compression_ratio", "speedup_vector",
++                    "speedup_value"])
++        for dist in dists:
++            for enc in encs:
++                e = table.get((dist, enc), {})
++                w.writerow([dist, enc] + [f"{e[c]:.3f}" if c in e else ""
++                                          for c in ("mb", "ratio", "speedup_vector",
++                                                    "speedup_value")])
++    print(f"wrote {stem}.csv")
++
++    ratio = {key: e["ratio"] for key, e in table.items()}
++    speed = {m: {key: e[f"speedup_{m}"] for key, e in table.items() if f"speedup_{m}" in e}
++             for m in MODES}
++    modes = [m for m in MODES if speed[m]]
++    speed_lim = padded_limits([v for m in modes for v in speed[m].values()])
++
++    fig, axes = plt.subplots(1 + len(modes), 1, figsize=(9, 3.0 * (1 + len(modes)) + 0.6),
++                             dpi=150)
++    fig.patch.set_facecolor(SURFACE)
++    bar_panel(axes[0], dists, encs, ratio,
++              "Compression ratio vs uncompressed DSM (higher = smaller)",
++              padded_limits(list(ratio.values())))
++    for ax, m in zip(axes[1:], modes):
++        bar_panel(ax, dists, encs, speed[m],
++                  f"Speedup vs uncompressed DSM, {m} mode (above 1× = faster)", speed_lim)
++
++    # Header in inches from the top, so it stays put whatever the figure height.
++    height = fig.get_figheight()
++    y = lambda inches: 1 - inches / height
++    fig.text(0.01, y(0.15), f"{query}: what each encoding buys, per data distribution",
++             ha="left", va="top", color=TEXT, fontsize=12, fontweight="bold")
++    fig.text(0.01, y(0.45), f"{rows:,} rows × {cols} int64 columns, k = N = {cols} (full scan); "
++             "medians of 10 runs, single thread", ha="left", va="top", color=MUTED, fontsize=9)
++    handles, labels = axes[0].get_legend_handles_labels()
++    fig.legend(handles, labels, loc="upper left", ncol=len(encs), frameon=False,
++               labelcolor=TEXT, fontsize=9, bbox_to_anchor=(0.0, y(0.62)))
++    fig.tight_layout(rect=(0, 0, 1, y(1.0)))
++    fig.savefig(f"{stem}.png", facecolor=SURFACE)
++    plt.close(fig)
++    print(f"wrote {stem}.png")
++
++    size_chart(f"{stem}_size.png", query, rows, cols, dists, encs, table)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/perf_metrics.py b/scripts/perf_metrics.py
+index 35e1c21..10850fe 100644
+--- a/scripts/perf_metrics.py
++++ b/scripts/perf_metrics.py
+@@ -1,8 +1,8 @@
+ """Turn the hardware-counter columns of a scan_bench CSV row into per-row metrics."""
+ 
+ # Columns every scan_bench CSV has; anything after these is a perf counter.
+-BASE_COLUMNS = ["query", "layout", "rows", "cols", "k", "page_size", "iteration",
+-                "latency_ns", "result"]
++BASE_COLUMNS = ["query", "layout", "dist", "rows", "cols", "k", "page_size",
++                "footprint_bytes", "iteration", "latency_ns", "result"]
+ 
+ 
+ def counter_columns(fieldnames):
+diff --git a/scripts/plot.py b/scripts/plot.py
+index 24c3d83..64aec5e 100644
+--- a/scripts/plot.py
++++ b/scripts/plot.py
+@@ -20,14 +20,35 @@ from matplotlib.ticker import FuncFormatter, LogLocator  # noqa: E402
+ 
+ from perf_metrics import counter_columns, metrics  # noqa: E402
+ 
+-# Fixed colour per layout so a layout looks the same in every graph.
++# Fixed colour per layout so a layout looks the same in every graph. Encoded DSM layouts
++# (DSM-<encoding>-<mode>) are coloured by encoding and styled by mode: solid = vector,
++# dashed = value. Slots follow the categorical palette order; plain (no compression,
++# only the scan machinery) is a neutral reference.
+ LAYOUT_COLORS = {"NSM": "#2a78d6", "DSM": "#eb6834", "PAX": "#1baf7a"}
++ENCODING_COLORS = {"plain": "#6f6e69", "bitpack": "#eda100", "for": "#e87ba4",
++                   "dict": "#008300", "rle": "#6250d6", "delta": "#e34948"}
++MODE_STYLES = {"vector": "-", "value": "--"}
+ TEXT = "#0b0b0b"
+ MUTED = "#898781"
+ GRID = "#e1e0d9"
+ SURFACE = "#fcfcfb"
+ 
+ 
++def series_order(layout):
++    """Sort key: base layouts first, then encodings in palette order, vector before value."""
++    if layout in LAYOUT_COLORS:
++        return (0, list(LAYOUT_COLORS).index(layout), 0)
++    _, enc, mode = layout.split("-")
++    return (1, list(ENCODING_COLORS).index(enc), list(MODE_STYLES).index(mode))
++
++
++def series_style(layout):
++    if layout in LAYOUT_COLORS:
++        return LAYOUT_COLORS[layout], "-"
++    _, enc, mode = layout.split("-")
++    return ENCODING_COLORS[enc], MODE_STYLES[mode]
++
++
+ def load(path):
+     """Returns ({series name: {(query, layout, k): [values]}}, meta).
+     Series are "latency" (ms) plus one per perf metric if the CSV has counters."""
+@@ -42,6 +63,7 @@ def load(path):
+             for name, value in metrics(row, counters).items():
+                 series[name][key].append(value)
+             meta["rows"], meta["cols"] = int(row["rows"]), int(row["cols"])
++            meta["dist"] = row["dist"]
+             if int(row["page_size"]):
+                 meta["page_size"] = int(row["page_size"])
+     return series, meta
+@@ -52,7 +74,9 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
+     fig.patch.set_facecolor(SURFACE)
+     ax.set_facecolor(SURFACE)
+ 
+-    layouts = [l for l in LAYOUT_COLORS if any(key[:2] == (query, l) for key in lat)]
++    layouts = sorted({l for (q, l, _) in lat if q == query}, key=series_order)
++    # Min-max bands are drawn only for a few series; with many they overlap into a wash.
++    bands = len(layouts) <= 4
+     all_ks = set()
+     for layout in layouts:
+         ks = sorted(k for (q, l, k) in lat if q == query and l == layout)
+@@ -61,9 +85,10 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
+         med = [statistics.median(r) for r in runs]
+         lo = [min(r) for r in runs]
+         hi = [max(r) for r in runs]
+-        color = LAYOUT_COLORS[layout]
+-        ax.fill_between(ks, lo, hi, color=color, alpha=0.12, linewidth=0)
+-        ax.plot(ks, med, color=color, linewidth=2, marker="o", markersize=6,
++        color, style = series_style(layout)
++        if bands:
++            ax.fill_between(ks, lo, hi, color=color, alpha=0.12, linewidth=0)
++        ax.plot(ks, med, color=color, linestyle=style, linewidth=2, marker="o", markersize=6,
+                 markeredgecolor=SURFACE, markeredgewidth=1.5, label=layout,
+                 solid_capstyle="round", solid_joinstyle="round")
+ 
+@@ -85,9 +110,9 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
+     what = "latency (ms" if metric == "latency" else f"{metric} (median"
+     if metric == "latency":
+         what += ", median"
+-    ax.set_ylabel(f"{what}{scale}; band = min–max)", color=TEXT)
++    ax.set_ylabel(f"{what}{scale}" + ("; band = min–max)" if bands else ")"), color=TEXT)
+ 
+-    subtitle = f"{meta['rows']:,} rows × {meta['cols']} int64 columns"
++    subtitle = f"{meta['rows']:,} rows × {meta['cols']} int64 columns, {meta['dist']} data"
+     if "page_size" in meta:
+         subtitle += f", PAX page {meta['page_size'] // 1024} KB"
+     ax.set_title(f"{query}: {metric} vs k\n", loc="left", color=TEXT, fontsize=12,
+@@ -101,7 +126,12 @@ def plot_query(query, lat, meta, out_path, logy, metric="latency"):
+     for side in ("left", "bottom"):
+         ax.spines[side].set_color(GRID)
+     ax.tick_params(colors=MUTED, labelcolor=TEXT)
+-    ax.legend(frameon=False, loc="upper left", labelcolor=TEXT)
++    if len(layouts) <= 4:
++        ax.legend(frameon=False, loc="upper left", labelcolor=TEXT)
++    else:  # many series: legend beside the plot so it never covers the lines
++        fig.set_size_inches(9.5, 4.8)
++        ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1), labelcolor=TEXT,
++                  fontsize=8, handlelength=3)
+ 
+     fig.tight_layout()
+     fig.savefig(out_path, facecolor=SURFACE)
+diff --git a/scripts/summarize.py b/scripts/summarize.py
+index 829c690..4395739 100755
+--- a/scripts/summarize.py
++++ b/scripts/summarize.py
+@@ -31,12 +31,13 @@ def main():
+     if not groups:
+         sys.exit("summarize.py: no benchmark rows on stdin")
+ 
+-    header = ["query", "layout", "k", "p=k/N", "page_size", "median_ms", "min_ms", "max_ms",
+-              "read_GB/s"]
++    header = ["query", "layout", "k", "p=k/N", "page_size", "size_MB", "ratio", "median_ms",
++              "min_ms", "max_ms", "read_GB/s"]
+     table = []
+     for (query, k, layout), runs in sorted(groups.items()):
+         lat = [int(r["latency_ns"]) for r in runs]
+-        rows, cols, page_size = (int(runs[0][f]) for f in ("rows", "cols", "page_size"))
++        rows, cols, page_size, footprint = (
++            int(runs[0][f]) for f in ("rows", "cols", "page_size", "footprint_bytes"))
+         median = statistics.median(lat)
+         table.append([
+             query,
+@@ -44,10 +45,12 @@ def main():
+             str(k),
+             f"{k / cols:.3f}",
+             str(page_size) if page_size else "-",
++            f"{footprint / 2**20:.2f}",
++            f"{rows * cols * 8 / footprint:.2f}",  # compression ratio vs 8 bytes per value
+             f"{median / 1e6:.3f}",
+             f"{min(lat) / 1e6:.3f}",
+             f"{max(lat) / 1e6:.3f}",
+-            f"{rows * k * 8 / median:.2f}",  # input bytes read per ns == GB/s
++            f"{rows * k * 8 / median:.2f}",  # logical (decoded) bytes per ns == GB/s
+         ])
+     print_table(header, table)
+ 
+diff --git a/src/encoded_dsm.cpp b/src/encoded_dsm.cpp
+new file mode 100644
+index 0000000..42b277e
+--- /dev/null
++++ b/src/encoded_dsm.cpp
+@@ -0,0 +1,36 @@
++#include "encoded_dsm.h"
++
++#include "query.h"
++
++std::string scan_mode_name(ScanMode m) { return m == ScanMode::Value ? "value" : "vector"; }
++
++bool parse_scan_mode(const std::string& name, ScanMode& out) {
++    if (name == "value") out = ScanMode::Value;
++    else if (name == "vector") out = ScanMode::Vector;
++    else return false;
++    return true;
++}
++
++EncodedColumns::EncodedColumns(const Table& t, Encoding e) : encoding(e), rows(t.rows) {
++    std::vector<int64_t> values(t.rows);
++    columns.reserve(t.cols);
++    for (std::size_t c = 0; c < t.cols; ++c) {
++        for (std::size_t r = 0; r < t.rows; ++r) values[r] = t.at(r, c);
++        columns.push_back(encode_column(e, values));
++    }
++}
++
++EncodedDsmLayout::EncodedDsmLayout(std::shared_ptr<const EncodedColumns> data, ScanMode mode)
++    : data_(std::move(data)), mode_(mode) {}
++
++std::string EncodedDsmLayout::name() const {
++    return "DSM-" + encoding_name(data_->encoding) + "-" + scan_mode_name(mode_);
++}
++
++std::size_t EncodedDsmLayout::footprint_bytes() const {
++    std::size_t bytes = 0;
++    for (const auto& c : data_->columns) bytes += c->footprint_bytes();
++    return bytes;
++}
++
++void EncodedDsmLayout::run(Query& q) const { q.run(*this); }
+diff --git a/src/encoded_dsm.h b/src/encoded_dsm.h
+new file mode 100644
+index 0000000..4a124ca
+--- /dev/null
++++ b/src/encoded_dsm.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <memory>
++#include <vector>
++
++#include "encodings/encoded_column.h"
++#include "layout.h"
++#include "table.h"
++
++// How a query reads an encoded column.
++//   Value:  one ColumnCursor::next() call (virtual) per value.
++//   Vector: one EncodedColumn::decode() call (virtual) per kBatch values into a buffer,
++//           then a tight loop over the buffer.
++enum class ScanMode { Value, Vector };
++
++std::string scan_mode_name(ScanMode m);
++bool parse_scan_mode(const std::string& name, ScanMode& out);
++
++// All columns of a table in one encoding. Shared by the Value and Vector layouts so the
++// data is encoded (and held in memory) only once per encoding.
++struct EncodedColumns {
++    EncodedColumns(const Table& t, Encoding e);
++
++    Encoding encoding;
++    std::size_t rows;
++    std::vector<std::unique_ptr<EncodedColumn>> columns;
++};
++
++// DSM (one storage unit per column) with every column encoded, read in one scan mode.
++// Named DSM-<encoding>-<mode>, e.g. DSM-dict-vector.
++class EncodedDsmLayout : public Layout {
++public:
++    EncodedDsmLayout(std::shared_ptr<const EncodedColumns> data, ScanMode mode);
++
++    std::string name() const override;
++    std::size_t rows() const override { return data_->rows; }
++    std::size_t cols() const override { return data_->columns.size(); }
++    std::size_t footprint_bytes() const override;
++
++    void run(Query& q) const override;
++
++    Encoding encoding() const { return data_->encoding; }
++    ScanMode mode() const { return mode_; }
++    const EncodedColumn& column(std::size_t c) const { return *data_->columns[c]; }
++
++private:
++    std::shared_ptr<const EncodedColumns> data_;
++    ScanMode mode_;
++};
+diff --git a/src/encodings/bitpack.cpp b/src/encodings/bitpack.cpp
+new file mode 100644
+index 0000000..4b2ca70
+--- /dev/null
++++ b/src/encodings/bitpack.cpp
+@@ -0,0 +1,63 @@
++// bitpack: one frame for the whole column. Stores v - min(column) in w bits, where w is
++// the width of max - min. Compresses well only if the whole column has a narrow range.
++#include <algorithm>
++
++#include "encodings/bits.h"
++#include "encodings/encoded_column.h"
++
++namespace {
++
++class BitpackCursor final : public ColumnCursor {
++public:
++    BitpackCursor(const uint64_t* words, unsigned w, uint64_t min) : words_(words), w_(w), min_(min) {}
++    int64_t next() override {
++        return static_cast<int64_t>(bits::extract(words_, w_, i_++) + min_);
++    }
++
++private:
++    const uint64_t* words_;
++    unsigned w_;
++    uint64_t min_;
++    std::size_t i_ = 0;
++};
++
++class BitpackColumn final : public EncodedColumn {
++public:
++    explicit BitpackColumn(const std::vector<int64_t>& values) : n_(values.size()) {
++        if (values.empty()) return;
++        auto [lo, hi] = std::minmax_element(values.begin(), values.end());
++        min_ = static_cast<uint64_t>(*lo);
++        w_ = bits::width_for(static_cast<uint64_t>(*hi) - min_);
++        std::vector<uint64_t> offsets(values.size());
++        for (std::size_t i = 0; i < values.size(); ++i)
++            offsets[i] = static_cast<uint64_t>(values[i]) - min_;
++        bits::pack(offsets.data(), offsets.size(), w_, words_);
++    }
++
++    std::size_t size() const override { return n_; }
++    std::size_t footprint_bytes() const override {
++        return words_.size() * sizeof(uint64_t) + sizeof(min_) + sizeof(w_);
++    }
++
++    void decode(std::size_t start, std::size_t n, int64_t* out) const override {
++        uint64_t* u = reinterpret_cast<uint64_t*>(out);
++        bits::unpack(words_.data() + start / bits::kGroup * w_, w_, bits::groups_for(n), u);
++        for (std::size_t i = 0; i < n; ++i) u[i] += min_;
++    }
++
++    std::unique_ptr<ColumnCursor> cursor() const override {
++        return std::make_unique<BitpackCursor>(words_.data(), w_, min_);
++    }
++
++private:
++    std::size_t n_;
++    uint64_t min_ = 0;
++    unsigned w_ = 0;
++    std::vector<uint64_t> words_;
++};
++
++}  // namespace
++
++std::unique_ptr<EncodedColumn> make_bitpack_column(const std::vector<int64_t>& values) {
++    return std::make_unique<BitpackColumn>(values);
++}
+diff --git a/src/encodings/bits.cpp b/src/encodings/bits.cpp
+new file mode 100644
+index 0000000..8eeb6a9
+--- /dev/null
++++ b/src/encodings/bits.cpp
+@@ -0,0 +1,64 @@
++#include "encodings/bits.h"
++
++#include <array>
++#include <utility>
++
++namespace bits {
++
++void pack(const uint64_t* values, std::size_t n, unsigned w, std::vector<uint64_t>& out) {
++    const std::size_t base = out.size();
++    out.resize(base + words_for(n, w), 0);
++    if (w == 0) return;
++    uint64_t* dst = out.data() + base;
++    for (std::size_t i = 0; i < n; ++i) {
++        const std::size_t bit = i * w;
++        const std::size_t word = bit / 64;
++        const unsigned shift = bit % 64;
++        dst[word] |= values[i] << shift;
++        if (shift + w > 64) dst[word + 1] |= values[i] >> (64 - shift);
++    }
++}
++
++namespace {
++
++// One group of 64 values at compile-time width W. After unrolling, every word index,
++// shift and the "crosses a word" test are constants.
++template <unsigned W>
++inline void unpack_group(const uint64_t* in, uint64_t* out) {
++    if constexpr (W == 0) {
++        for (unsigned i = 0; i < kGroup; ++i) out[i] = 0;
++    } else {
++        constexpr uint64_t mask = W == 64 ? ~uint64_t{0} : (uint64_t{1} << W) - 1;
++#pragma GCC unroll 64
++        for (unsigned i = 0; i < kGroup; ++i) {
++            const unsigned bit = i * W;
++            const unsigned word = bit / 64;
++            const unsigned shift = bit % 64;
++            uint64_t v = in[word] >> shift;
++            if (shift + W > 64) v |= in[word + 1] << ((64 - shift) & 63);
++            out[i] = v & mask;
++        }
++    }
++}
++
++template <unsigned W>
++void unpack_groups(const uint64_t* in, std::size_t groups, uint64_t* out) {
++    for (std::size_t g = 0; g < groups; ++g) unpack_group<W>(in + g * W, out + g * kGroup);
++}
++
++using UnpackFn = void (*)(const uint64_t*, std::size_t, uint64_t*);
++
++template <std::size_t... W>
++constexpr std::array<UnpackFn, sizeof...(W)> make_table(std::index_sequence<W...>) {
++    return {&unpack_groups<static_cast<unsigned>(W)>...};
++}
++
++constexpr auto kUnpack = make_table(std::make_index_sequence<65>{});
++
++}  // namespace
++
++void unpack(const uint64_t* in, unsigned w, std::size_t groups, uint64_t* out) {
++    kUnpack[w](in, groups, out);
++}
++
++}  // namespace bits
+diff --git a/src/encodings/bits.h b/src/encodings/bits.h
+new file mode 100644
+index 0000000..1a7b6b9
+--- /dev/null
++++ b/src/encodings/bits.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// Bit-packing of unsigned integers at a fixed width w (0..64 bits per value), LSB first.
++//
++// Values are packed in groups of 64: a group of width w is exactly w 64-bit words, so
++// every group starts on a word boundary and can be unpacked by a kernel specialised for
++// w (see unpack()). A packed run of n values is padded with zeros to a whole number of
++// groups.
++namespace bits {
++
++constexpr std::size_t kGroup = 64;
++
++// Bits needed to store every value in [0, max_value]; 0 when max_value == 0.
++inline unsigned width_for(uint64_t max_value) {
++    return max_value == 0 ? 0 : 64 - static_cast<unsigned>(__builtin_clzll(max_value));
++}
++
++inline std::size_t groups_for(std::size_t n) { return (n + kGroup - 1) / kGroup; }
++
++inline std::size_t words_for(std::size_t n, unsigned w) { return groups_for(n) * w; }
++
++// Appends values[0, n), each < 2^w, to out at width w.
++void pack(const uint64_t* values, std::size_t n, unsigned w, std::vector<uint64_t>& out);
++
++// Value i of a packed run of width w starting at `in` (value-at-a-time access).
++inline uint64_t extract(const uint64_t* in, unsigned w, std::size_t i) {
++    if (w == 0) return 0;
++    const std::size_t bit = i * w;
++    const std::size_t word = bit / 64;
++    const unsigned shift = bit % 64;
++    uint64_t v = in[word] >> shift;
++    // A value never crosses a group's last word, so in[word + 1] is in bounds here.
++    if (shift + w > 64) v |= in[word + 1] << (64 - shift);
++    return w == 64 ? v : v & ((uint64_t{1} << w) - 1);
++}
++
++// Unpacks `groups` whole groups (64 * groups values) of width w from `in` into out.
++// Dispatches once on w to a fully unrolled kernel with constant shifts and masks.
++void unpack(const uint64_t* in, unsigned w, std::size_t groups, uint64_t* out);
++
++// Zigzag maps signed deltas to unsigned so small negative values stay small.
++inline uint64_t zigzag(uint64_t d) { return (d << 1) ^ (0 - (d >> 63)); }
++inline uint64_t unzigzag(uint64_t z) { return (z >> 1) ^ (0 - (z & 1)); }
++
++}  // namespace bits
+diff --git a/src/encodings/delta.cpp b/src/encodings/delta.cpp
+new file mode 100644
+index 0000000..1763ac1
+--- /dev/null
++++ b/src/encodings/delta.cpp
+@@ -0,0 +1,93 @@
++// delta: per block of kBatch values, the block's first value plus the difference of each
++// value from the previous one, zigzag-encoded and bit-packed at the block's width.
++// Compresses well when neighbouring values are close (e.g. sorted data). Decoding is a
++// running sum, so each value depends on the one before it.
++#include <algorithm>
++
++#include "encodings/bits.h"
++#include "encodings/encoded_column.h"
++
++namespace {
++
++struct Block {
++    uint64_t first;
++    std::size_t offset;  // first word of this block in words_
++    unsigned width;
++};
++
++class DeltaCursor final : public ColumnCursor {
++public:
++    DeltaCursor(const std::vector<Block>& blocks, const uint64_t* words)
++        : blocks_(blocks), words_(words) {}
++    int64_t next() override {
++        const Block& b = blocks_[i_ / kBatch];
++        const std::size_t j = i_ % kBatch;
++        if (j == 0) acc_ = b.first;  // the first delta of a block is always 0
++        acc_ += bits::unzigzag(bits::extract(words_ + b.offset, b.width, j));
++        ++i_;
++        return static_cast<int64_t>(acc_);
++    }
++
++private:
++    // i_ and acc_ are kept apart on purpose: when adjacent, GCC merges their stores into
++    // one 16-byte store, and the next call's 8-byte loads of them cannot be
++    // store-forwarded from it (Zen 3), costing ~25 cycles per value.
++    std::size_t i_ = 0;
++    const std::vector<Block>& blocks_;
++    const uint64_t* words_;
++    uint64_t acc_ = 0;
++};
++
++class DeltaColumn final : public EncodedColumn {
++public:
++    explicit DeltaColumn(const std::vector<int64_t>& values) : n_(values.size()) {
++        std::vector<uint64_t> deltas(kBatch);
++        for (std::size_t start = 0; start < n_; start += kBatch) {
++            const std::size_t n = std::min(kBatch, n_ - start);
++            deltas[0] = 0;
++            uint64_t widest = 0;
++            for (std::size_t i = 1; i < n; ++i) {
++                uint64_t d = static_cast<uint64_t>(values[start + i]) -
++                             static_cast<uint64_t>(values[start + i - 1]);
++                deltas[i] = bits::zigzag(d);
++                widest = std::max(widest, deltas[i]);
++            }
++            Block b{static_cast<uint64_t>(values[start]), words_.size(),
++                    bits::width_for(widest)};
++            bits::pack(deltas.data(), n, b.width, words_);
++            blocks_.push_back(b);
++        }
++    }
++
++    std::size_t size() const override { return n_; }
++    std::size_t footprint_bytes() const override {
++        // Per block: 8-byte first value, 4-byte word offset, 1-byte width.
++        return words_.size() * sizeof(uint64_t) + blocks_.size() * (8 + 4 + 1);
++    }
++
++    void decode(std::size_t start, std::size_t n, int64_t* out) const override {
++        const Block& b = blocks_[start / kBatch];
++        uint64_t* u = reinterpret_cast<uint64_t*>(out);
++        bits::unpack(words_.data() + b.offset, b.width, bits::groups_for(n), u);
++        uint64_t acc = b.first;
++        for (std::size_t i = 0; i < n; ++i) {
++            acc += bits::unzigzag(u[i]);
++            u[i] = acc;
++        }
++    }
++
++    std::unique_ptr<ColumnCursor> cursor() const override {
++        return std::make_unique<DeltaCursor>(blocks_, words_.data());
++    }
++
++private:
++    std::size_t n_;
++    std::vector<Block> blocks_;
++    std::vector<uint64_t> words_;
++};
++
++}  // namespace
++
++std::unique_ptr<EncodedColumn> make_delta_column(const std::vector<int64_t>& values) {
++    return std::make_unique<DeltaColumn>(values);
++}
+diff --git a/src/encodings/dict.cpp b/src/encodings/dict.cpp
+new file mode 100644
+index 0000000..3b2de03
+--- /dev/null
++++ b/src/encodings/dict.cpp
+@@ -0,0 +1,63 @@
++// dict: a sorted array of the column's distinct values, plus one bit-packed code per row
++// (the value's index in that array). Compresses well when there are few distinct
++// values, regardless of how large or spread out the values themselves are.
++#include <algorithm>
++
++#include "encodings/bits.h"
++#include "encodings/encoded_column.h"
++
++namespace {
++
++class DictCursor final : public ColumnCursor {
++public:
++    DictCursor(const int64_t* dict, const uint64_t* words, unsigned w)
++        : dict_(dict), words_(words), w_(w) {}
++    int64_t next() override { return dict_[bits::extract(words_, w_, i_++)]; }
++
++private:
++    const int64_t* dict_;
++    const uint64_t* words_;
++    unsigned w_;
++    std::size_t i_ = 0;
++};
++
++class DictColumn final : public EncodedColumn {
++public:
++    explicit DictColumn(const std::vector<int64_t>& values) : n_(values.size()), dict_(values) {
++        std::sort(dict_.begin(), dict_.end());
++        dict_.erase(std::unique(dict_.begin(), dict_.end()), dict_.end());
++        w_ = dict_.empty() ? 0 : bits::width_for(dict_.size() - 1);
++        std::vector<uint64_t> codes(values.size());
++        for (std::size_t i = 0; i < values.size(); ++i)
++            codes[i] = std::lower_bound(dict_.begin(), dict_.end(), values[i]) - dict_.begin();
++        bits::pack(codes.data(), codes.size(), w_, words_);
++    }
++
++    std::size_t size() const override { return n_; }
++    std::size_t footprint_bytes() const override {
++        return dict_.size() * sizeof(int64_t) + words_.size() * sizeof(uint64_t) + sizeof(w_);
++    }
++
++    void decode(std::size_t start, std::size_t n, int64_t* out) const override {
++        // Unpack the codes into out, then replace each code with its value in place.
++        uint64_t* u = reinterpret_cast<uint64_t*>(out);
++        bits::unpack(words_.data() + start / bits::kGroup * w_, w_, bits::groups_for(n), u);
++        for (std::size_t i = 0; i < n; ++i) out[i] = dict_[u[i]];
++    }
++
++    std::unique_ptr<ColumnCursor> cursor() const override {
++        return std::make_unique<DictCursor>(dict_.data(), words_.data(), w_);
++    }
++
++private:
++    std::size_t n_;
++    std::vector<int64_t> dict_;
++    unsigned w_ = 0;
++    std::vector<uint64_t> words_;
++};
++
++}  // namespace
++
++std::unique_ptr<EncodedColumn> make_dict_column(const std::vector<int64_t>& values) {
++    return std::make_unique<DictColumn>(values);
++}
+diff --git a/src/encodings/encoded_column.cpp b/src/encodings/encoded_column.cpp
+new file mode 100644
+index 0000000..df31686
+--- /dev/null
++++ b/src/encodings/encoded_column.cpp
+@@ -0,0 +1,54 @@
++#include "encodings/encoded_column.h"
++
++#include <stdexcept>
++
++namespace {
++
++struct EncodingInfo {
++    Encoding encoding;
++    const char* name;
++    std::unique_ptr<EncodedColumn> (*make)(const std::vector<int64_t>&);
++};
++
++// To add an encoding: write src/encodings/<name>.cpp and add one entry here.
++const EncodingInfo kEncodings[] = {
++    {Encoding::Plain, "plain", make_plain_column},
++    {Encoding::Bitpack, "bitpack", make_bitpack_column},
++    {Encoding::For, "for", make_for_column},
++    {Encoding::Dict, "dict", make_dict_column},
++    {Encoding::Rle, "rle", make_rle_column},
++    {Encoding::Delta, "delta", make_delta_column},
++};
++
++const EncodingInfo& info(Encoding e) {
++    for (const auto& i : kEncodings)
++        if (i.encoding == e) return i;
++    throw std::logic_error("unregistered encoding");
++}
++
++}  // namespace
++
++const std::vector<Encoding>& all_encodings() {
++    static const std::vector<Encoding> all = [] {
++        std::vector<Encoding> v;
++        for (const auto& i : kEncodings) v.push_back(i.encoding);
++        return v;
++    }();
++    return all;
++}
++
++std::string encoding_name(Encoding e) { return info(e).name; }
++
++bool parse_encoding(const std::string& name, Encoding& out) {
++    for (const auto& i : kEncodings) {
++        if (name == i.name) {
++            out = i.encoding;
++            return true;
++        }
++    }
++    return false;
++}
++
++std::unique_ptr<EncodedColumn> encode_column(Encoding e, const std::vector<int64_t>& values) {
++    return info(e).make(values);
++}
+diff --git a/src/encodings/encoded_column.h b/src/encodings/encoded_column.h
+new file mode 100644
+index 0000000..285dfd1
+--- /dev/null
++++ b/src/encodings/encoded_column.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++// Values per vectorized batch. Block-based encodings (FOR, delta) also use blocks of
++// kBatch values, and vectorized scans always start a batch at a multiple of kBatch, so a
++// batch is always exactly one block.
++constexpr std::size_t kBatch = 1024;
++
++// Value-at-a-time reader over one column: each next() decodes and returns one value.
++// It is a virtual call per value, like a tuple-at-a-time (Volcano) scan operator that
++// does not know the encoding at compile time.
++class ColumnCursor {
++public:
++    virtual ~ColumnCursor() = default;
++    // Must be called at most size() times.
++    virtual int64_t next() = 0;
++};
++
++// One encoded int64 column.
++class EncodedColumn {
++public:
++    virtual ~EncodedColumn() = default;
++
++    virtual std::size_t size() const = 0;
++
++    // Bytes the encoded data occupies (packed values, dictionaries, per-block headers).
++    virtual std::size_t footprint_bytes() const = 0;
++
++    // Vectorized: decodes values [start, start + n) into out with one virtual call.
++    // Requires start % kBatch == 0 and n <= kBatch. `out` must have room for kBatch
++    // values: decoders may write past n, up to the next multiple of 64.
++    virtual void decode(std::size_t start, std::size_t n, int64_t* out) const = 0;
++
++    // Value-at-a-time: a cursor positioned at row 0.
++    virtual std::unique_ptr<ColumnCursor> cursor() const = 0;
++};
++
++enum class Encoding { Plain, Bitpack, For, Dict, Rle, Delta };
++
++const std::vector<Encoding>& all_encodings();
++std::string encoding_name(Encoding e);
++// Returns false if `name` is not an encoding.
++bool parse_encoding(const std::string& name, Encoding& out);
++
++std::unique_ptr<EncodedColumn> encode_column(Encoding e, const std::vector<int64_t>& values);
++
++// One factory per encoding, each in src/encodings/<name>.cpp.
++std::unique_ptr<EncodedColumn> make_plain_column(const std::vector<int64_t>& values);
++std::unique_ptr<EncodedColumn> make_bitpack_column(const std::vector<int64_t>& values);
++std::unique_ptr<EncodedColumn> make_for_column(const std::vector<int64_t>& values);
++std::unique_ptr<EncodedColumn> make_dict_column(const std::vector<int64_t>& values);
++std::unique_ptr<EncodedColumn> make_rle_column(const std::vector<int64_t>& values);
++std::unique_ptr<EncodedColumn> make_delta_column(const std::vector<int64_t>& values);
+diff --git a/src/encodings/for.cpp b/src/encodings/for.cpp
+new file mode 100644
+index 0000000..cbcdd09
+--- /dev/null
++++ b/src/encodings/for.cpp
+@@ -0,0 +1,78 @@
++// for (frame of reference): like bitpack, but with a separate frame per block of kBatch
++// values: each block stores its own min and bit width, so it adapts to local ranges
++// (e.g. sorted data, where each block covers a small slice of the value range).
++#include <algorithm>
++
++#include "encodings/bits.h"
++#include "encodings/encoded_column.h"
++
++namespace {
++
++struct Block {
++    uint64_t min;
++    std::size_t offset;  // first word of this block in words_
++    unsigned width;
++};
++
++class ForCursor final : public ColumnCursor {
++public:
++    ForCursor(const std::vector<Block>& blocks, const uint64_t* words)
++        : blocks_(blocks), words_(words) {}
++    int64_t next() override {
++        const Block& b = blocks_[i_ / kBatch];
++        uint64_t v = bits::extract(words_ + b.offset, b.width, i_ % kBatch) + b.min;
++        ++i_;
++        return static_cast<int64_t>(v);
++    }
++
++private:
++    const std::vector<Block>& blocks_;
++    const uint64_t* words_;
++    std::size_t i_ = 0;
++};
++
++class ForColumn final : public EncodedColumn {
++public:
++    explicit ForColumn(const std::vector<int64_t>& values) : n_(values.size()) {
++        std::vector<uint64_t> offsets(kBatch);
++        for (std::size_t start = 0; start < n_; start += kBatch) {
++            const std::size_t n = std::min(kBatch, n_ - start);
++            auto first = values.begin() + start;
++            auto [lo, hi] = std::minmax_element(first, first + n);
++            Block b{static_cast<uint64_t>(*lo), words_.size(), 0};
++            b.width = bits::width_for(static_cast<uint64_t>(*hi) - b.min);
++            for (std::size_t i = 0; i < n; ++i)
++                offsets[i] = static_cast<uint64_t>(values[start + i]) - b.min;
++            bits::pack(offsets.data(), n, b.width, words_);
++            blocks_.push_back(b);
++        }
++    }
++
++    std::size_t size() const override { return n_; }
++    std::size_t footprint_bytes() const override {
++        // Per block: 8-byte min, 4-byte word offset, 1-byte width.
++        return words_.size() * sizeof(uint64_t) + blocks_.size() * (8 + 4 + 1);
++    }
++
++    void decode(std::size_t start, std::size_t n, int64_t* out) const override {
++        const Block& b = blocks_[start / kBatch];
++        uint64_t* u = reinterpret_cast<uint64_t*>(out);
++        bits::unpack(words_.data() + b.offset, b.width, bits::groups_for(n), u);
++        for (std::size_t i = 0; i < n; ++i) u[i] += b.min;
++    }
++
++    std::unique_ptr<ColumnCursor> cursor() const override {
++        return std::make_unique<ForCursor>(blocks_, words_.data());
++    }
++
++private:
++    std::size_t n_;
++    std::vector<Block> blocks_;
++    std::vector<uint64_t> words_;
++};
++
++}  // namespace
++
++std::unique_ptr<EncodedColumn> make_for_column(const std::vector<int64_t>& values) {
++    return std::make_unique<ForColumn>(values);
++}
+diff --git a/src/encodings/plain.cpp b/src/encodings/plain.cpp
+new file mode 100644
+index 0000000..f69dee1
+--- /dev/null
++++ b/src/encodings/plain.cpp
+@@ -0,0 +1,44 @@
++// plain: the values as an int64 array, exactly like DSM. Measures the cost of the
++// cursor / batch machinery itself, with no decoding work.
++#include <cstring>
++
++#include "aligned_buffer.h"
++#include "encodings/encoded_column.h"
++
++namespace {
++
++class PlainCursor final : public ColumnCursor {
++public:
++    explicit PlainCursor(const int64_t* p) : p_(p) {}
++    int64_t next() override { return *p_++; }
++
++private:
++    const int64_t* p_;
++};
++
++class PlainColumn final : public EncodedColumn {
++public:
++    explicit PlainColumn(const std::vector<int64_t>& values) : data_(values.size()) {
++        std::memcpy(data_.data(), values.data(), values.size() * sizeof(int64_t));
++    }
++
++    std::size_t size() const override { return data_.size(); }
++    std::size_t footprint_bytes() const override { return data_.size() * sizeof(int64_t); }
++
++    void decode(std::size_t start, std::size_t n, int64_t* out) const override {
++        std::memcpy(out, data_.data() + start, n * sizeof(int64_t));
++    }
++
++    std::unique_ptr<ColumnCursor> cursor() const override {
++        return std::make_unique<PlainCursor>(data_.data());
++    }
++
++private:
++    AlignedBuffer<int64_t> data_;
++};
++
++}  // namespace
++
++std::unique_ptr<EncodedColumn> make_plain_column(const std::vector<int64_t>& values) {
++    return std::make_unique<PlainColumn>(values);
++}
+diff --git a/src/encodings/rle.cpp b/src/encodings/rle.cpp
+new file mode 100644
+index 0000000..2b06a6b
+--- /dev/null
++++ b/src/encodings/rle.cpp
+@@ -0,0 +1,73 @@
++// rle (run-length encoding): one (value, run end) pair per run of equal consecutive
++// values. Run ends are cumulative, so the run holding any row can be binary-searched.
++// Compresses well only when values repeat in long runs.
++#include <algorithm>
++
++#include "encodings/encoded_column.h"
++
++namespace {
++
++class RleCursor final : public ColumnCursor {
++public:
++    RleCursor(const int64_t* values, const uint64_t* ends)
++        : values_(values), ends_(ends), left_(ends[0]) {}
++    int64_t next() override {
++        if (left_ == 0) {
++            ++run_;
++            left_ = ends_[run_] - ends_[run_ - 1];
++        }
++        --left_;
++        return values_[run_];
++    }
++
++private:
++    const int64_t* values_;
++    const uint64_t* ends_;
++    std::size_t run_ = 0;
++    uint64_t left_;  // rows still to return from the current run
++};
++
++class RleColumn final : public EncodedColumn {
++public:
++    explicit RleColumn(const std::vector<int64_t>& values) : n_(values.size()) {
++        for (std::size_t i = 0; i < values.size(); ++i) {
++            if (i == 0 || values[i] != values[i - 1]) {
++                values_.push_back(values[i]);
++                ends_.push_back(i + 1);
++            } else {
++                ends_.back() = i + 1;
++            }
++        }
++    }
++
++    std::size_t size() const override { return n_; }
++    std::size_t footprint_bytes() const override {
++        return values_.size() * (sizeof(int64_t) + sizeof(uint64_t));
++    }
++
++    void decode(std::size_t start, std::size_t n, int64_t* out) const override {
++        std::size_t run = std::upper_bound(ends_.begin(), ends_.end(), start) - ends_.begin();
++        std::size_t pos = 0;
++        while (pos < n) {
++            const std::size_t stop = std::min<std::size_t>(ends_[run] - start, n);
++            std::fill(out + pos, out + stop, values_[run]);
++            pos = stop;
++            ++run;
++        }
++    }
++
++    std::unique_ptr<ColumnCursor> cursor() const override {
++        return std::make_unique<RleCursor>(values_.data(), ends_.data());
++    }
++
++private:
++    std::size_t n_;
++    std::vector<int64_t> values_;
++    std::vector<uint64_t> ends_;  // ends_[r] = one past the last row of run r
++};
++
++}  // namespace
++
++std::unique_ptr<EncodedColumn> make_rle_column(const std::vector<int64_t>& values) {
++    return std::make_unique<RleColumn>(values);
++}
+diff --git a/src/main.cpp b/src/main.cpp
+index 7a3d574..5a759a0 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -11,6 +11,8 @@
+ #include <vector>
+ 
+ #include "dsm.h"
++#include "encoded_dsm.h"
++#include "encodings/encoded_column.h"
+ #include "layout.h"
+ #include "nsm.h"
+ #include "pax.h"
+@@ -56,6 +58,11 @@ struct Options {
+     std::vector<const QueryEntry*> queries;  // empty -> all
+     std::string output;   // empty -> stdout
+     std::string perf_set;  // empty -> no hardware counters
++    Distribution dist = Distribution::Uniform;
++    std::size_t run_length = 64;
++    bool nsm = true, dsm = true, pax = true;  // uncompressed layouts to run
++    std::vector<Encoding> encodings;          // encoded DSM layouts; empty -> none
++    std::vector<ScanMode> modes{ScanMode::Value, ScanMode::Vector};
+ };
+ 
+ [[noreturn]] void usage(const char* prog) {
+@@ -71,7 +78,16 @@ struct Options {
+               << "  --output FILE    write CSV to FILE instead of stdout\n"
+               << "  --perf SET       also record hardware counters per run; SET is one of";
+     for (const auto& s : PerfCounters::set_names()) std::cerr << ' ' << s;
+-    std::cerr << "\n";
++    std::cerr << "\n"
++              << "  --dist D         data distribution (default uniform); one of";
++    for (Distribution d : all_distributions()) std::cerr << ' ' << distribution_name(d);
++    std::cerr << "\n"
++              << "  --run-length L   mean run length for --dist runs (default 64)\n"
++              << "  --layout L1,L2   uncompressed layouts to run: nsm,dsm,pax or none (default all)\n"
++              << "  --encoding E1,E2 also run DSM with each column encoded; 'all' or any of";
++    for (Encoding e : all_encodings()) std::cerr << ' ' << encoding_name(e);
++    std::cerr << "\n"
++              << "  --mode M1,M2     scan modes for encoded layouts: value,vector (default both)\n";
+     std::exit(1);
+ }
+ 
+@@ -112,9 +128,55 @@ Options parse_args(int argc, char** argv) {
+         }
+         else if (arg == "--output") o.output = val;
+         else if (arg == "--perf") o.perf_set = val;
++        else if (arg == "--dist") {
++            if (!parse_distribution(val, o.dist)) {
++                std::cerr << "error: unknown distribution '" << val << "'\n";
++                usage(argv[0]);
++            }
++        } else if (arg == "--run-length") o.run_length = std::stoull(val);
++        else if (arg == "--layout") {
++            o.nsm = o.dsm = o.pax = false;
++            for (const auto& name : split_commas(val)) {
++                if (name == "nsm") o.nsm = true;
++                else if (name == "dsm") o.dsm = true;
++                else if (name == "pax") o.pax = true;
++                else if (name != "none") {
++                    std::cerr << "error: unknown layout '" << name << "'\n";
++                    usage(argv[0]);
++                }
++            }
++        } else if (arg == "--encoding") {
++            o.encodings.clear();
++            if (val == "all") {
++                o.encodings = all_encodings();
++            } else {
++                for (const auto& name : split_commas(val)) {
++                    Encoding e;
++                    if (!parse_encoding(name, e)) {
++                        std::cerr << "error: unknown encoding '" << name << "'\n";
++                        usage(argv[0]);
++                    }
++                    o.encodings.push_back(e);
++                }
++            }
++        } else if (arg == "--mode") {
++            o.modes.clear();
++            for (const auto& name : split_commas(val)) {
++                ScanMode m;
++                if (!parse_scan_mode(name, m)) {
++                    std::cerr << "error: unknown mode '" << name << "'\n";
++                    usage(argv[0]);
++                }
++                o.modes.push_back(m);
++            }
++        }
+         else usage(argv[0]);
+     }
+     if (o.rows == 0 || o.cols == 0) usage(argv[0]);
++    if (!o.nsm && !o.dsm && !o.pax && (o.encodings.empty() || o.modes.empty())) {
++        std::cerr << "error: no layouts selected\n";
++        usage(argv[0]);
++    }
+     if (o.ks.empty()) {
+         for (std::size_t k = 1; k < o.cols; k *= 2) o.ks.push_back(static_cast<int>(k));
+         o.ks.push_back(static_cast<int>(o.cols));
+@@ -145,10 +207,18 @@ int main(int argc, char** argv) {
+     // --- Setup (untimed): generate data once, build every layout from it. ---
+     std::vector<std::unique_ptr<Layout>> layouts;
+     try {
+-        Table table = generate_table(opt.rows, opt.cols, kSeed);
+-        layouts.push_back(std::make_unique<NsmLayout>(table));
+-        layouts.push_back(std::make_unique<DsmLayout>(table));
+-        layouts.push_back(std::make_unique<PaxLayout>(table, opt.page_size));
++        Table table = generate_table(opt.rows, opt.cols, kSeed, opt.dist, opt.run_length);
++        if (opt.nsm) layouts.push_back(std::make_unique<NsmLayout>(table));
++        if (opt.dsm) layouts.push_back(std::make_unique<DsmLayout>(table));
++        if (opt.pax) layouts.push_back(std::make_unique<PaxLayout>(table, opt.page_size));
++        if (!opt.modes.empty()) {
++            for (Encoding e : opt.encodings) {
++                // Encoded once; the value and vector layouts share the same columns.
++                auto data = std::make_shared<const EncodedColumns>(table, e);
++                for (ScanMode m : opt.modes)
++                    layouts.push_back(std::make_unique<EncodedDsmLayout>(data, m));
++            }
++        }
+     } catch (const std::exception& e) {  // logical table is freed on scope exit either way
+         std::cerr << "error: " << e.what() << "\n";
+         return 1;
+@@ -156,7 +226,8 @@ int main(int argc, char** argv) {
+ 
+     const double mb = 1024.0 * 1024.0;
+     std::cerr << "Table: " << opt.rows << " rows x " << opt.cols << " cols, "
+-              << (opt.rows * opt.cols * sizeof(int64_t)) / mb << " MB of data\n";
++              << (opt.rows * opt.cols * sizeof(int64_t)) / mb << " MB of data, "
++              << distribution_name(opt.dist) << " distribution\n";
+     for (const auto& l : layouts)
+         std::cerr << "  " << l->name() << " footprint: " << l->footprint_bytes() / mb << " MB\n";
+ 
+@@ -207,11 +278,12 @@ int main(int argc, char** argv) {
+         }
+     }
+     std::ostream& out = opt.output.empty() ? std::cout : file;
+-    out << "query,layout,rows,cols,k,page_size,iteration,latency_ns,result";
++    out << "query,layout,dist,rows,cols,k,page_size,footprint_bytes,iteration,latency_ns,result";
+     if (counters)
+         for (const auto& name : counters->names()) out << ',' << name;
+     out << '\n';
+ 
++    const std::string dist = distribution_name(opt.dist);
+     for (const QueryEntry* qe : opt.queries) {
+         for (int k : opt.ks) {
+             auto q = qe->make(first_k_columns(k), opt.rows);  // untimed setup
+@@ -236,9 +308,9 @@ int main(int argc, char** argv) {
+                     g_sink = g_sink + result;
+                     auto ns =
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+-                    out << q->name() << ',' << l->name() << ',' << opt.rows << ',' << opt.cols
+-                        << ',' << k << ',' << page_size << ',' << i << ',' << ns << ','
+-                        << result;
++                    out << q->name() << ',' << l->name() << ',' << dist << ',' << opt.rows
++                        << ',' << opt.cols << ',' << k << ',' << page_size << ','
++                        << l->footprint_bytes() << ',' << i << ',' << ns << ',' << result;
+                     if (counters)
+                         for (uint64_t v : counters->values()) out << ',' << v;
+                     out << '\n';
+diff --git a/src/queries/projection.cpp b/src/queries/projection.cpp
+index e60f8f4..8bc014d 100644
+--- a/src/queries/projection.cpp
++++ b/src/queries/projection.cpp
+@@ -1,16 +1,23 @@
+ #include "queries/projection.h"
+ 
++#include <algorithm>
++#include <memory>
++
+ #include "dsm.h"
++#include "encoded_dsm.h"
+ #include "nsm.h"
+ #include "pax.h"
+ 
+ ProjectionQuery::ProjectionQuery(std::vector<int> columns, std::size_t rows)
+-    : columns_(std::move(columns)), out_(rows * columns_.size()) {}
++    : columns_(std::move(columns)), out_(rows * columns_.size()), batch_(kBatch) {}
+ 
+ void ProjectionQuery::run(const NsmLayout& t) {
++    // Read once: rows() is virtual, so `r < t.rows()` would re-check the vtable on every
++    // iteration and stop the compiler from vectorizing the loop.
++    const std::size_t rows = t.rows();
+     const std::size_t m = columns_.size();
+     int64_t* out = out_.data();
+-    for (std::size_t r = 0; r < t.rows(); ++r) {
++    for (std::size_t r = 0; r < rows; ++r) {
+         const int64_t* tuple = t.row(r);
+         int64_t* dst = out + r * m;
+         for (std::size_t j = 0; j < m; ++j) dst[j] = tuple[columns_[j]];
+@@ -18,13 +25,16 @@ void ProjectionQuery::run(const NsmLayout& t) {
+ }
+ 
+ void ProjectionQuery::run(const DsmLayout& t) {
++    // Read once: rows() is virtual, so `r < t.rows()` would re-check the vtable on every
++    // iteration and stop the compiler from vectorizing the loop.
++    const std::size_t rows = t.rows();
+     const std::size_t m = columns_.size();
+     std::vector<const int64_t*> cols(m);
+     for (std::size_t j = 0; j < m; ++j) cols[j] = t.column(columns_[j]);
+ 
+     // Tuple at a time: each output row gathers one value from each of m column arrays.
+     int64_t* out = out_.data();
+-    for (std::size_t r = 0; r < t.rows(); ++r) {
++    for (std::size_t r = 0; r < rows; ++r) {
+         int64_t* dst = out + r * m;
+         for (std::size_t j = 0; j < m; ++j) dst[j] = cols[j][r];
+     }
+@@ -47,6 +57,35 @@ void ProjectionQuery::run(const PaxLayout& t) {
+     }
+ }
+ 
++void ProjectionQuery::run(const EncodedDsmLayout& t) {
++    // Read once: rows() is virtual, so `r < t.rows()` would re-check the vtable on every
++    // iteration and stop the compiler from vectorizing the loop.
++    const std::size_t rows = t.rows();
++    const std::size_t m = columns_.size();
++    int64_t* out = out_.data();
++    if (t.mode() == ScanMode::Value) {
++        // Tuple at a time, like DSM: each output row pulls one value from each of m cursors.
++        std::vector<std::unique_ptr<ColumnCursor>> cursors;
++        for (int c : columns_) cursors.push_back(t.column(c).cursor());
++        for (std::size_t r = 0; r < rows; ++r) {
++            int64_t* dst = out + r * m;
++            for (std::size_t j = 0; j < m; ++j) dst[j] = cursors[j]->next();
++        }
++    } else {
++        // Batch at a time: decode kBatch values of one column, then scatter them into
++        // column j of the batch's kBatch output rows.
++        int64_t* buf = batch_.data();
++        for (std::size_t start = 0; start < rows; start += kBatch) {
++            const std::size_t n = std::min(kBatch, rows - start);
++            int64_t* batch_out = out + start * m;
++            for (std::size_t j = 0; j < m; ++j) {
++                t.column(columns_[j]).decode(start, n, buf);
++                for (std::size_t i = 0; i < n; ++i) batch_out[i * m + j] = buf[i];
++            }
++        }
++    }
++}
++
+ int64_t ProjectionQuery::result() const {
+     // Unsigned arithmetic so overflow wraps instead of being undefined.
+     uint64_t checksum = 0;
+diff --git a/src/queries/projection.h b/src/queries/projection.h
+index 3b324e4..1e13811 100644
+--- a/src/queries/projection.h
++++ b/src/queries/projection.h
+@@ -3,6 +3,7 @@
+ #include <vector>
+ 
+ #include "aligned_buffer.h"
++#include "encodings/encoded_column.h"
+ #include "query.h"
+ 
+ // SELECT c1, c2, ... FROM table.
+@@ -19,6 +20,7 @@ public:
+     void run(const NsmLayout& t) override;
+     void run(const DsmLayout& t) override;
+     void run(const PaxLayout& t) override;
++    void run(const EncodedDsmLayout& t) override;
+ 
+     // Position-weighted checksum of the output, so values landing in the wrong row or
+     // column are caught, not just wrong values.
+@@ -27,4 +29,5 @@ public:
+ private:
+     std::vector<int> columns_;
+     AlignedBuffer<int64_t> out_;
++    AlignedBuffer<int64_t> batch_;  // decode buffer for vectorized scans
+ };
+diff --git a/src/queries/sum.cpp b/src/queries/sum.cpp
+index 72375f8..96b9c43 100644
+--- a/src/queries/sum.cpp
++++ b/src/queries/sum.cpp
+@@ -1,35 +1,68 @@
+ #include "queries/sum.h"
+ 
++#include <algorithm>
++
+ #include "dsm.h"
++#include "encoded_dsm.h"
+ #include "nsm.h"
+ #include "pax.h"
+ 
+ void SumQuery::run(const NsmLayout& t) {
+-    int64_t sum = 0;
+-    for (std::size_t r = 0; r < t.rows(); ++r) {
++    // Read once: rows() is virtual, so `r < t.rows()` would re-check the vtable on every
++    // iteration and stop the compiler from vectorizing the loop.
++    const std::size_t rows = t.rows();
++    uint64_t sum = 0;
++    for (std::size_t r = 0; r < rows; ++r) {
+         const int64_t* tuple = t.row(r);
+-        for (int c : columns_) sum += tuple[c];
++        for (int c : columns_) sum += static_cast<uint64_t>(tuple[c]);
+     }
+-    sum_ = sum;
++    sum_ = static_cast<int64_t>(sum);
+ }
+ 
+ void SumQuery::run(const DsmLayout& t) {
+-    int64_t sum = 0;
++    // Read once: rows() is virtual, so `r < t.rows()` would re-check the vtable on every
++    // iteration and stop the compiler from vectorizing the loop.
++    const std::size_t rows = t.rows();
++    uint64_t sum = 0;
+     for (int c : columns_) {
+         const int64_t* col = t.column(c);
+-        for (std::size_t r = 0; r < t.rows(); ++r) sum += col[r];
++        for (std::size_t r = 0; r < rows; ++r) sum += static_cast<uint64_t>(col[r]);
+     }
+-    sum_ = sum;
++    sum_ = static_cast<int64_t>(sum);
+ }
+ 
+ void SumQuery::run(const PaxLayout& t) {
+-    int64_t sum = 0;
++    uint64_t sum = 0;
+     for (std::size_t p = 0; p < t.num_pages(); ++p) {
+         std::size_t n = t.page_tuple_count(p);
+         for (int c : columns_) {
+             const int64_t* mp = t.minipage(p, c);
+-            for (std::size_t i = 0; i < n; ++i) sum += mp[i];
++            for (std::size_t i = 0; i < n; ++i) sum += static_cast<uint64_t>(mp[i]);
++        }
++    }
++    sum_ = static_cast<int64_t>(sum);
++}
++
++void SumQuery::run(const EncodedDsmLayout& t) {
++    // Read once: rows() is virtual, so `r < t.rows()` would re-check the vtable on every
++    // iteration and stop the compiler from vectorizing the loop.
++    const std::size_t rows = t.rows();
++    uint64_t sum = 0;
++    if (t.mode() == ScanMode::Value) {
++        for (int c : columns_) {
++            auto cur = t.column(c).cursor();
++            for (std::size_t r = 0; r < rows; ++r) sum += static_cast<uint64_t>(cur->next());
++        }
++    } else {
++        int64_t* buf = batch_.data();
++        for (int c : columns_) {
++            const EncodedColumn& col = t.column(c);
++            for (std::size_t start = 0; start < rows; start += kBatch) {
++                const std::size_t n = std::min(kBatch, rows - start);
++                col.decode(start, n, buf);
++                for (std::size_t i = 0; i < n; ++i) sum += static_cast<uint64_t>(buf[i]);
++            }
+         }
+     }
+-    sum_ = sum;
++    sum_ = static_cast<int64_t>(sum);
+ }
+diff --git a/src/queries/sum.h b/src/queries/sum.h
+index bb59e92..a76f5af 100644
+--- a/src/queries/sum.h
++++ b/src/queries/sum.h
+@@ -2,23 +2,28 @@
+ 
+ #include <vector>
+ 
++#include "aligned_buffer.h"
++#include "encodings/encoded_column.h"
+ #include "query.h"
+ 
+ // SELECT SUM(c1) + SUM(c2) + ... FROM table, over the given columns.
+ // Aggregates column by column wherever the layout allows; no tuple is ever reconstructed.
++// The sum wraps modulo 2^64 (unsigned arithmetic), so full-range data cannot overflow.
+ class SumQuery : public Query {
+ public:
+-    explicit SumQuery(std::vector<int> columns) : columns_(std::move(columns)) {}
++    explicit SumQuery(std::vector<int> columns) : columns_(std::move(columns)), batch_(kBatch) {}
+ 
+     std::string name() const override { return "sum"; }
+ 
+     void run(const NsmLayout& t) override;
+     void run(const DsmLayout& t) override;
+     void run(const PaxLayout& t) override;
++    void run(const EncodedDsmLayout& t) override;
+ 
+     int64_t result() const override { return sum_; }
+ 
+ private:
+     std::vector<int> columns_;
++    AlignedBuffer<int64_t> batch_;  // decode buffer for vectorized scans
+     int64_t sum_ = 0;
+ };
+diff --git a/src/query.h b/src/query.h
+index 8a37291..0eb18b5 100644
+--- a/src/query.h
++++ b/src/query.h
+@@ -6,6 +6,7 @@
+ class NsmLayout;
+ class DsmLayout;
+ class PaxLayout;
++class EncodedDsmLayout;
+ 
+ // A query has one run() overload per layout, so all of a query's layout-specific code
+ // lives together in its own file under src/queries/. Layouts only expose their storage.
+@@ -21,6 +22,7 @@ public:
+     virtual void run(const NsmLayout& t) = 0;
+     virtual void run(const DsmLayout& t) = 0;
+     virtual void run(const PaxLayout& t) = 0;
++    virtual void run(const EncodedDsmLayout& t) = 0;
+ 
+     // Value summarising the last run's output; must be identical across layouts.
+     // Called outside the timed region.
+diff --git a/src/table.cpp b/src/table.cpp
+index d7ea0fc..79ce912 100644
+--- a/src/table.cpp
++++ b/src/table.cpp
+@@ -1,15 +1,110 @@
+ #include "table.h"
+ 
++#include <algorithm>
+ #include <random>
+ 
+-Table generate_table(std::size_t rows, std::size_t cols, uint64_t seed) {
++namespace {
++
++constexpr std::size_t kZipfDistinct = 10'000;
++
++// Spreads Zipf ranks over the full int64 range, so a column's values have few distinct
++// values but no narrow range (dictionary encoding helps; bit-packing does not).
++uint64_t splitmix64(uint64_t x) {
++    x += 0x9e3779b97f4a7c15ULL;
++    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
++    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
++    return x ^ (x >> 31);
++}
++
++const std::pair<Distribution, const char*> kNames[] = {
++    {Distribution::Uniform, "uniform"}, {Distribution::Wide, "wide"},
++    {Distribution::Sorted, "sorted"},   {Distribution::Runs, "runs"},
++    {Distribution::Zipf, "zipf"},
++};
++
++}  // namespace
++
++const std::vector<Distribution>& all_distributions() {
++    static const std::vector<Distribution> all = [] {
++        std::vector<Distribution> v;
++        for (const auto& [d, _] : kNames) v.push_back(d);
++        return v;
++    }();
++    return all;
++}
++
++std::string distribution_name(Distribution d) {
++    for (const auto& [dist, name] : kNames)
++        if (dist == d) return name;
++    return "?";
++}
++
++bool parse_distribution(const std::string& name, Distribution& out) {
++    for (const auto& [dist, n] : kNames) {
++        if (name == n) {
++            out = dist;
++            return true;
++        }
++    }
++    return false;
++}
++
++Table generate_table(std::size_t rows, std::size_t cols, uint64_t seed, Distribution dist,
++                     std::size_t run_length) {
+     Table t;
+     t.rows = rows;
+     t.cols = cols;
+     t.values.resize(rows * cols);
+ 
+     std::mt19937_64 rng(seed);
+-    std::uniform_int_distribution<int64_t> dist(0, 99);
+-    for (auto& v : t.values) v = dist(rng);
++    switch (dist) {
++        case Distribution::Uniform: {
++            std::uniform_int_distribution<int64_t> u(0, 99);
++            for (auto& v : t.values) v = u(rng);
++            break;
++        }
++        case Distribution::Wide:
++            for (auto& v : t.values) v = static_cast<int64_t>(rng());
++            break;
++        case Distribution::Sorted: {
++            std::uniform_int_distribution<int64_t> start(0, 999), step(0, 7);
++            std::vector<int64_t> prev(cols);
++            for (auto& p : prev) p = start(rng);
++            for (std::size_t r = 0; r < rows; ++r)
++                for (std::size_t c = 0; c < cols; ++c) t.values[r * cols + c] = prev[c] += step(rng);
++            break;
++        }
++        case Distribution::Runs: {
++            std::uniform_int_distribution<int64_t> value(0, (int64_t{1} << 20) - 1);
++            std::uniform_int_distribution<std::size_t> length(1, 2 * std::max<std::size_t>(run_length, 1) - 1);
++            std::vector<int64_t> cur(cols);
++            std::vector<std::size_t> left(cols, 0);
++            for (std::size_t r = 0; r < rows; ++r) {
++                for (std::size_t c = 0; c < cols; ++c) {
++                    if (left[c] == 0) {
++                        cur[c] = value(rng);
++                        left[c] = length(rng);
++                    }
++                    --left[c];
++                    t.values[r * cols + c] = cur[c];
++                }
++            }
++            break;
++        }
++        case Distribution::Zipf: {
++            // P(rank k) proportional to 1 / k, sampled by binary search over the CDF.
++            std::vector<double> cdf(kZipfDistinct);
++            double total = 0;
++            for (std::size_t k = 0; k < kZipfDistinct; ++k) cdf[k] = total += 1.0 / (k + 1);
++            for (auto& x : cdf) x /= total;
++            std::uniform_real_distribution<double> u(0.0, 1.0);
++            for (auto& v : t.values) {
++                std::size_t rank = std::lower_bound(cdf.begin(), cdf.end(), u(rng)) - cdf.begin();
++                rank = std::min(rank, kZipfDistinct - 1);
++                v = static_cast<int64_t>(splitmix64(rank));
++            }
++            break;
++        }
++    }
+     return t;
+ }
+diff --git a/src/table.h b/src/table.h
+index fdbd036..b01d213 100644
+--- a/src/table.h
++++ b/src/table.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <string>
+ #include <vector>
+ 
+ // Logical table: the source of truth every physical layout is built from.
+@@ -14,5 +15,20 @@ struct Table {
+     int64_t at(std::size_t r, std::size_t c) const { return values[r * cols + c]; }
+ };
+ 
+-// Fills a rows x cols table with values uniform in [0, 100) from a fixed-seed mt19937_64.
+-Table generate_table(std::size_t rows, std::size_t cols, uint64_t seed);
++// How each column's values are generated. Every column is generated independently.
++//   uniform  uniform in [0, 100)                       (7 bits; the original benchmark data)
++//   wide     uniform over the full int64 range          (incompressible)
++//   sorted   increasing: each value = previous + uniform [0, 8)
++//   runs     runs of equal values, values in [0, 2^20), run lengths uniform in
++//            [1, 2 * run_length - 1] (mean run_length)
++//   zipf     Zipf(s = 1) over 10,000 distinct values, each a full-range int64
++enum class Distribution { Uniform, Wide, Sorted, Runs, Zipf };
++
++const std::vector<Distribution>& all_distributions();
++std::string distribution_name(Distribution d);
++// Returns false if `name` is not a distribution.
++bool parse_distribution(const std::string& name, Distribution& out);
++
++// Fills a rows x cols table from a fixed-seed mt19937_64.
++Table generate_table(std::size_t rows, std::size_t cols, uint64_t seed,
++                     Distribution dist = Distribution::Uniform, std::size_t run_length = 64);

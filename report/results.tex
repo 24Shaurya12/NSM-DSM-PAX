@@ -1,0 +1,151 @@
+% Results: the layout experiments. Why they look this way is in analysis.tex.
+All latencies are medians over 15 runs, from DRAM (4M rows $\times$ 16 attributes, 512\,MB per
+layout) unless the table size is the variable.
+
+\subsection{Projectivity}
+\label{sec:res:proj}
+
+\begin{figure}[t]
+\centering
+\fig{projectivity}
+\caption{Latency vs the number of attributes read, without a predicate. Left: SUM of $k$
+attributes. Right: projection of $k$ attributes into row-major output tuples.}
+\label{fig:projectivity}
+\end{figure}
+
+\Cref{fig:projectivity} varies the number $k$ of the 16 attributes a query reads.
+\begin{itemize}
+\item \textbf{Aggregation.} DSM's time grows in proportion to $k$, from 1.0\ms{} at $k{=}1$ to
+18\ms{} at $k{=}16$, because it reads exactly $k$ arrays. NSM's hardly depends on $k$
+(13--22\ms), because every row's cache lines come in anyway. At $k{=}1$ DSM is 15$\times$
+faster, close to the 16$\times$ ratio of bytes moved. PAX reads only the needed minipages too,
+but pays a fixed cost per minipage: 3.9\ms{} at $k{=}1$, 4$\times$ DSM (\cref{sec:res:pax}).
+\item \textbf{Projection.} Every layout also writes $8k$ bytes of output per row. DSM still wins
+at low projectivity (4.0\ms{} vs NSM's 19\ms{} at $k{=}1$) and up to $k{=}8$, and NSM wins at
+$k{=}16$ (61\ms{} vs DSM's 72\ms{} and PAX's 79\ms). The crossover lies between $k{=}8$ and
+$k{=}16$.
+\item \textbf{Strategy.} Without a predicate, late is slower than early on DSM for $k \ge 2$,
+by 30\% at $k{=}16$ (94 vs 72\ms), because it writes each vector's output one attribute at a
+time (\cref{sec:analysis:recon}).
+\end{itemize}
+
+\subsection{Selectivity}
+\label{sec:res:sel}
+
+\begin{figure}[p]
+\centering
+\fig{selectivity}
+\caption{Latency vs selectivity for every layout and strategy. Each row of panels is one
+query; the predicate is \code{c0 < x} and $c_0$ is among the attributes read. Both axes are
+logarithmic.}
+\label{fig:selectivity}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Selectivity at which late stops beating early, log-interpolated between measured
+points.}
+\label{tab:crossovers}
+\gen{selectivity_crossovers}
+\end{table}
+
+\Cref{fig:selectivity} sweeps the selectivity of \code{c0 < x} from 0.01\% to 100\% for four
+queries under the four fixed strategies, and \cref{tab:crossovers} gives where late stops
+beating early.
+\begin{itemize}
+\item \textbf{DSM is where the strategy matters most.} At 0.01\%, late reads $c_0$ and a few
+lines of the other attributes: \code{SELECT *} takes 2.3\ms{} against early's 21\ms, 9$\times$
+less. Early's time is nearly flat up to about 5\%, because it always reads all $k$ attributes.
+Late's grows with the selectivity and crosses early's at 2.4\% for $k{=}4$ and 7.4\% for
+$k{=}16$: the more attributes late can skip, the longer it stays ahead. With $k{=}2$ there is
+little to skip, and the two are within 2\% of each other from 0.5\% to 2\%. At 100\%, late is
+45\% slower (99 vs 68\ms).
+\item \textbf{NSM barely cares.} Every row's lines are read whatever the strategy, so the
+strategies differ only in CPU work (15--23\ms{} for \code{SELECT *} at low selectivity).
+\item \textbf{PAX early is slow at every selectivity} with the default 16\,KB pages:
+\code{SELECT *} takes 55--63\ms{} up to 20\%, 2.6$\times$ DSM early, while PAX late follows DSM
+late at a fixed offset (\cref{sec:analysis:cache}).
+\item \textbf{Branches.} \emph{early-pipe} and \emph{late-branch} peak near 50\%, where the
+branch is least predictable: for $k{=}2$ on DSM, late-branch takes 17.6\ms{} against late's
+6.9\ms. The branch-free variants have no peak, so we use them from here on.
+\item \textbf{Aggregation} has lower crossovers (DSM 1.4\%, PAX 3.3\%): early SUM writes
+nothing and stays at about 3.6\ms{} on DSM, so late has less to save.
+\item \textbf{Other predicates} behave like their selectivity. An equality is a range of width
+one and costs what \code{c0 < x} costs at the same selectivity (7.5 vs 6.9\ms{} for DSM late
+\code{SELECT *} at 1\%). A conjunction costs what its combined selectivity costs, because late
+refines the selection vector with the second predicate only at the surviving positions: adding
+\code{c1 = 7} to \code{c0 = 42} cuts DSM late from 7.5 to 3.0\ms.
+\end{itemize}
+
+\subsection{Table width}
+\label{sec:res:width}
+
+Keeping the table at 512\,MB while $N$ grows from 2 to 256 (so rows get wider and fewer)
+changes the picture in two ways. For SUM(c0), DSM's time falls as $1/N$, while NSM's falls much
+more slowly (25 to 2.1\ms), because beyond $N{=}8$ it still reads one line per row. For
+\code{SELECT *} of every row, reconstruction gets more expensive for the columnar layouts as
+rows widen (DSM 63\ms{} at $N{=}4$, 106\ms{} at $N{=}256$; PAX 68 to 131\ms), while NSM's
+row-major copy stays at 66--69\ms. Beyond about 16 streams, neither the 8-way L1 nor the
+prefetcher keeps up with stitching $N$ columns. At 1\% selectivity NSM becomes the fastest from
+$N{=}128$ (4.8 vs 5.2\ms{} for DSM): each qualifying row is then a short contiguous range,
+while DSM fetches one line per qualifying row from each of $N$ columns.
+
+\subsection{Working-set size}
+\label{sec:res:ws}
+
+\begin{figure}[t]
+\centering
+\fig{workingset}
+\caption{Time per row vs table size ($N{=}16$), from 16\,KB (in L1) to 512\,MB. Dotted lines
+mark the cache capacities. Small tables are scanned repeatedly until a sample lasts 20\ms.}
+\label{fig:workingset}
+\end{figure}
+
+\Cref{fig:workingset} varies the table size from 16\,KB to 512\,MB.
+\begin{itemize}
+\item \textbf{SUM(c0)} costs DSM 0.08--0.10\,ns per row from L2 and L3 and 0.26\,ns from
+DRAM, and NSM 0.5--0.6\,ns in cache and 3.8\,ns from DRAM. The NSM/DSM ratio grows from about
+5$\times$ in L2 to 15$\times$ in DRAM: in cache the difference is CPU work (a strided load per
+row against vectorized contiguous loads), in DRAM it is bytes.
+\item \textbf{SUM of all 16 attributes.} From DRAM every layout moves the same 128 bytes per
+row (4.3--5.5\,ns). In cache NSM is twice as slow as DSM (2.5 vs 1.1--1.4\,ns), because summing
+across a row vectorizes worse than summing down a column.
+\item \textbf{\code{SELECT *}.} DSM is the fastest while the table fits in L2 or a quarter of
+L3 (2.2--3.1\,ns per row against NSM's 3.1--3.5), and NSM once the table fills L3 (13.0 vs
+13.6\,ns at 16\,MB, 16.1 vs 18.1\,ns from DRAM). The reconstruction crossover depends on
+where the data lives, not only on the layout.
+\item Going from a 4\,MB table (in L3) to DRAM costs 2.3--5.8$\times$ for every query and
+layout, more than any layout difference for wide queries.
+\end{itemize}
+
+\subsection{PAX page size}
+\label{sec:res:pax}
+
+\begin{figure}[t]
+\centering
+\fig{pax_pagesize}
+\caption{PAX latency vs page size: plain packing, 64 bytes of padding after each minipage,
+and an odd-line minipage stride (\code{--pax-pad auto}). Horizontal lines: DSM with the same
+query and strategy. The predicate on $c_0$ passes 1\% or all rows.}
+\label{fig:pax}
+\end{figure}
+
+\Cref{fig:pax} varies the PAX page size from 1\,KB to 4\,MB. A minipage is $P/16$ bytes: 64
+bytes at 1\,KB, 1\,KB at the default 16\,KB, 256\,KB at 4\,MB.
+\begin{itemize}
+\item \textbf{One attribute} (SUM(c0)) gets faster as pages grow: 20.1\ms{} at 1\,KB, 4.9 at
+16\,KB, 2.8 at 64\,KB and 1.2 at 4\,MB, which equals DSM. At 16\,KB the excess over DSM is
+3.7\ms{} over 31{,}250 pages, about 120\,ns per page, roughly one DRAM latency.
+\item \textbf{\code{SELECT *} at 1\%.} Late falls from 12.9\ms{} at 16\,KB to 6.5\ms{} at
+256\,KB, reaching DSM late (7.1\ms). Early with plain packing stays at 38--66\ms{} at every
+size, 1.7--2.9$\times$ DSM early (22.7\ms), and gets \emph{worse} from 64\,KB (65.6\ms) as
+pages grow; with an odd-line minipage stride it drops to 23--28\ms.
+\item \textbf{\code{SELECT *} of every row.} Late is fastest with tiny pages (71--72\ms{} at
+1--2\,KB, 86--101\ms{} from 16\,KB): a page of 8 tuples keeps a vector's output tile in L1.
+\item \textbf{64 bytes of padding} per minipage changes nothing from 16\,KB up and wastes
+space below.
+\end{itemize}
+So the PAX page size trades the prefetcher, which wants long minipages, against
+reconstruction locality, which wants small pages. The 8--16\,KB pages of disk-based PAX are on
+the wrong side of it for scans in memory. \Cref{sec:analysis:cache} explains both effects and
+\cref{sec:tuning} fixes them.

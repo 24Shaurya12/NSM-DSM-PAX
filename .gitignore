@@ -1,0 +1,15 @@
+.venv/
+build/
+output/
+__pycache__/
+build-dev/
+results_quick/
+*.csv.tmp
+# LaTeX intermediates (report/report.pdf itself is kept)
+report/*.aux
+report/*.log
+report/*.out
+report/*.fls
+report/*.fdb_latexmk
+report/*.toc
+report/*.synctex.gz

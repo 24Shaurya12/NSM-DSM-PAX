@@ -1,0 +1,11 @@
+# Where late materialization's time goes (2026-11-15). DSM projection, 4M x 16, from DRAM.
+# Run by hand (not part of scripts/experiments.py). Every run had the correctness check on,
+# except first_pass_* (--no-check).
+sweep.csv:             taskset -c 2 ./build/scan_bench --rows 4000000 --cols 16 --domain 1000000 --iters 5 --rounds 3 --warmup 1 --dsm-offset auto --layout dsm --query projection --k 1,2,4,8,16 --sel 0.0001,0.01,0.024,0.05,0.074,0.1 --strategy early,late
+first_pass_scalar.csv: taskset -c 2 ./build/scan_bench --rows 4000000 --cols 16 --domain 1000000 --iters 5 --rounds 3 --warmup 1 --dsm-offset auto --layout dsm --query projection --k 1,16 --sel 0.0001,0.05 --strategy early,late --no-check
+first_pass_avx2.csv:   taskset -c 2 ./build/scan_bench --rows 4000000 --cols 16 --domain 1000000 --iters 5 --rounds 3 --warmup 1 --dsm-offset auto --layout dsm --query projection --k 1,16 --sel 0.0001,0.05 --strategy early,late --simd --no-check
+gather_per_column_N:   taskset -c 2 ./build/scan_bench --rows 4000000 --cols 16 --domain 1000000 --iters 5 --rounds 3 --warmup 1 --dsm-offset auto --layout dsm --query projection --k 2,4,8,16 --sel 0.001,0.01,0.024,0.05,0.074,0.1,0.2 --strategy early,late
+gather_fused_N:        FUSED_GATHER=1 (same command) --strategy late
+# gather_fused_* used a temporary patch to kern::gather_project (src/kernels.h): for columnar
+# chunks, one pass over the selection vector writing all m attributes of each row, as the
+# row-store branch does. The patch was reverted; FUSED_GATHER does nothing in the current tree.

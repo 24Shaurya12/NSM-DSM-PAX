@@ -1,0 +1,165 @@
+% Early vs late: what late pays for, the threshold, cache, and choosing per chunk.
+
+Late materialization reads the predicate column in full, and of every other column only the
+lines that hold a selected row. Early streams every referenced column in full. This section
+measures why late's smaller line count does not always win, turns that into a threshold, and
+shows how the answer changes when the data is in cache.
+
+\subsection{What late pays for}
+\label{sec:mat:cost}
+
+\begin{table}[t]
+\centering\small
+\caption{Lines late reads from one gathered column, per 8{,}000 rows (1{,}000 lines of 8
+values). Lines $= 1000 \cdot f(s)$.}
+\label{tab:linecount}
+\begin{tabular}{rrrr}
+\toprule
+Selected & Values wanted & Lines read & Values brought in \\
+\midrule
+1\% & 80 & 77 & 616 \\
+5\% & 400 & 337 & 2{,}696 \\
+10\% & 800 & 570 & 4{,}560 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Late reads lines, not values.} \Cref{tab:linecount} shows how fast $f(s)$ grows. At
+1\% late touches 8\% of a column's lines, at 5\% a third, at 10\% more than half, while it wants
+only one value from each. Two further costs, which the line count of \cref{tab:linemodel}
+leaves out, decide where late stops winning. We separated them by timing late and early on DSM
+for $k = 1$ to 16 at 0.01--10\% (\code{results/late\_breakdown/}).
+\begin{itemize}
+\item \textbf{A fixed first pass.} Building the selection vector with scalar code costs about 2
+cycles per row, against about 1.2 for streaming 8 bytes from DRAM. Late with $k{=}1$ at
+0.01\% takes 2.05\ms{} for 4M rows. With the AVX2 selection vector (\cref{sec:mat:cache}) it
+takes 1.21\ms, the time of one bare column read, so the scalar pass is CPU-bound and costs
+about 0.7 column scans more than reading $c_0$.
+\item \textbf{A gathered line costs more than a streamed one}, 2.2--3.2 times per touched line.
+A gathered column takes 0.34\ms{} at 1\% (8\% of its lines), 0.66\ms{} at 2.4\% (18\%),
+1.17\ms{} at 5\% (34\%) and 1.97\ms{} at 10\% (57\%), against 1.27--1.63\ms{} for a whole
+column in early. Gathered lines are sparse and irregular, so the prefetcher cannot run ahead of
+them, and each is a separate DRAM access limited by latency and the number of misses in flight.
+At 5\%, gathering a third of a column (1.28\ms{} with $k{=}2$) already takes longer than
+reading all of it (1.21\ms).
+\end{itemize}
+The first pass is paid once per query, and every column late skips pays some of it back. That
+is why the crossover grows with $k$: 1.6\% for $k{=}2$, 2.4\% for $k{=}4$, 7.4\% for $k{=}16$
+(\cref{tab:crossovers}).
+
+\subsection{A threshold from the line size}
+\label{sec:mat:threshold}
+
+In units of one sequential column scan per row, early costs $1 + g$ and late
+$1 + \sigma + g\,f(s)/\varphi$, where $g$ is the number of attributes late gathers, $1/\varphi$
+the cost of a gathered line relative to a streamed one, and $\sigma$ late's fixed cost. Late
+wins while
+\[
+  f(s) < \varphi\,(1-\sigma/g)
+  \quad\Longleftrightarrow\quad
+  s < 1-\bigl(1-\varphi(1-\sigma/g)\bigr)^{1/v}.
+\]
+The machine enters through $v = \text{line size}/\text{value width}$. Fitted to the DSM
+crossovers from DRAM, $\varphi = 0.55$ and $\sigma = 2$, and the rule predicts 2.5\% for $g=3$
+and 7.8\% for $g=15$, against 2.4\% and 7.4\% measured. The two constants are a joint fit, not
+the costs measured one at a time (0.7 scans and 2.2--3.2$\times$): the model charges early a
+constant cost per column and assumes a constant $\varphi$, which the measurements do not, and
+with the measured values it would predict 4.4\% and 5.5\%. The rule also shows two things.
+Late can never win when $g \le \sigma$, i.e.\ when it skips at most two attributes, and for
+$g=1$ late is indeed at most 18\% faster. And packing more values into a line lowers the
+threshold: a 10-bit column holds 51 values per line, so $f(1\%)$ is already 0.40
+(\cref{sec:enc:compressed}).
+
+\subsection{In cache, instructions per row decide}
+\label{sec:mat:cache}
+
+\begin{table}[t]
+\centering
+\caption{Selectivity at which late stops beating early with the table in L3 (4\,MB, compare
+\cref{tab:crossovers}).}
+\label{tab:crossovers_cache}
+\gen{selectivity_cache_crossovers}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{Where late stops beating early on DSM ($k{=}4$), with the scalar and the AVX2
+selection vector.}
+\label{tab:simdcross}
+\gen{simd_crossovers}
+\end{table}
+
+With the table in L3 (\cref{tab:crossovers_cache}), the crossovers move apart in opposite
+directions. Projections favour late much longer: 20\% instead of 2.4\% for $k{=}4$ on DSM, 33\%
+instead of 7.4\% for $k{=}16$, because a gathered line now costs an L3 hit instead of a DRAM
+access, while early still pays the CPU time of copying every row. SUM goes the other way: late
+never wins on DSM or PAX.
+
+The reason is that cache shrinks early's cost far more than late's. For SUM of 4 DSM columns,
+early's cost is bytes: 4.4 cycles per row from DRAM, 1.2 in L3 (0.30\,ns), where the reads are
+about three times faster and early's masked sum (\code{total += row\_sum \& mask}: no branch,
+no store, the same work for every row) is vectorized by the compiler. Late's first pass is
+instructions: about 2.1 cycles per row from DRAM and 1.9 in L3 (0.46\,ns). In L3, late spends
+more on building the selection vector alone than early spends on the whole query, so it loses
+even at 0.01\%, where it skips almost every line.
+
+\paragraph{A hand-written SIMD selection vector.} The compiler cannot vectorize the selection
+loop, although the build allows AVX2 (\code{-march=native}). Its output is a packed list:
+where row $i$ goes depends on how many earlier rows passed (a stream compaction), so the lanes
+of a register cannot be processed independently. Our AVX2 kernel compares 8 values with two
+4-lane 64-bit compares (\code{vpcmpgtq}, signed only, so the sign bit is flipped to make the
+range test unsigned), turns the result into an 8-bit mask (\code{movemask}), loads the
+positions of the set bits from a 256-entry table (8\,KB, stays in L1), adds the vector offset,
+stores all 8 and advances the output index by \code{popcount}(mask). AVX2 has no compress
+instruction; AVX-512's \code{vpcompressd} would replace the table, but Zen~3 has no AVX-512.
+\begin{itemize}
+\item In cache the first pass drops from about 2 to 0.9 cycles per row (0.46 to 0.20\,ns in
+L3, 0.51 to 0.24 in L2), now below early's 1.2, and late SUM wins up to 3.4\% in L3 and 5.8\%
+in L2 (\cref{tab:simdcross}).
+\item From DRAM, late is memory-bound and gains about a third only at the lowest
+selectivities (the first pass falls from 2.05 to 1.21\ms); the crossovers move from 1.2--2\% to
+about 3\%.
+\item Early does not use a selection vector and is unchanged.
+\end{itemize}
+
+\subsection{Choosing per chunk}
+\label{sec:mat:auto}
+
+\begin{table}[t]
+\centering\small
+\caption{Auto against the better of early and late at each of 10 selectivities, with the table
+in L3: geometric mean / worst point over NSM, DSM and PAX (1.00 is always right).}
+\label{tab:autocache}
+\begin{tabular}{lccc}
+\toprule
+Query & DRAM constants & in-cache constants & measured (\cref{sec:tried}) \\
+\midrule
+SUM, $k{=}4$ & 1.19 / 1.68 & 1.20 / 1.55 & 1.09 / 1.16 \\
+\code{SELECT} $k{=}4$ & 1.06 / 1.35 & 1.05 / 1.20 & 1.06 / 1.12 \\
+\code{SELECT *} & 1.13 / 2.58 & \textbf{1.02 / 1.30} & 1.06 / 1.10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\emph{auto} applies the threshold to every span of at least 1024 rows, using the selectivity of
+the previous span. Spans are at least 1024 rows because a 128-row PAX page at 1\% holds 0 to 4
+qualifying rows, too few to estimate a selectivity from.
+\begin{itemize}
+\item \textbf{Where the constants were fitted it is enough.} From DRAM on uniform data, auto is
+within 1\% of the better fixed strategy on NSM and DSM at every selectivity (geometric mean);
+always running late would cost 21\% on DSM, always early 42\%.
+\item \textbf{On sorted data it beats both fixed strategies}, by 10\% on DSM on average and by
+up to 24\% (\code{SELECT *} at 10\%). The qualifying rows form one contiguous stretch, so
+late is right outside it and early inside, and choosing per span gets both.
+\item \textbf{The constants depend on where the data lives.} In L3, the DRAM constants pick
+early for \code{SELECT *} at 10--20\%, 2.3--2.6$\times$ too slow. Since the engine knows the
+table's size, \code{--auto-cache} switches to a second pair, fitted on the in-cache runs
+($\varphi = 1$, $\sigma = 2$: a gathered line costs about a streamed one), whenever the table
+fits in L3. That brings \code{SELECT *} to 1.02 on average and 1.30 at worst
+(\cref{tab:autocache}).
+\item \textbf{The remaining misses need more constants.} In cache, early SUM vectorizes and
+early \code{SELECT} does not, so one pair cannot fit both, and SUM stays up to 1.55$\times$ off.
+On PAX from DRAM, whose early strategy is slower than DSM's, \code{SELECT *} is up to
+2.4$\times$ off. A threshold per query class and layout would fix both, at the price of more
+fitted constants.
+\end{itemize}

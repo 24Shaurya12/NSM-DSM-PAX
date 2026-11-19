@@ -4,9 +4,10 @@
 #include <cstdint>
 #include <string>
 
+#include "query.h"
+
 // Common interface for all physical layouts so the benchmark driver is layout-agnostic.
-// New operators (predicated scans, tuple reconstruction, ...) are added here as further
-// virtual methods, implemented by each layout over its existing storage.
+// Layouts only own storage; query logic lives in src/queries/.
 class Layout {
 public:
     virtual ~Layout() = default;
@@ -18,6 +19,9 @@ public:
     // Bytes actually allocated for the table data (PAX may include page padding).
     virtual std::size_t footprint_bytes() const = 0;
 
-    // SUM over all values of columns [0, k).
-    virtual int64_t sum_first_k(int k) const = 0;
+    // Runs q against this layout by calling q.run(*this) with the concrete layout type.
+    virtual void run(Query& q) const = 0;
+
+    // Whether queries can run on this layout with strategy s.
+    virtual bool supports(Strategy) const { return true; }
 };

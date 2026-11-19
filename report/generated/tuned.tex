@@ -1,0 +1,25 @@
+\begin{tabular}{llrlrlrrr}
+\toprule
+& & \multicolumn{2}{c}{untuned} & \multicolumn{3}{c}{tuned} & \multicolumn{2}{c}{speedup} \\
+Query & Layout & ms & best strategy & ms & best strategy & auto & best & auto \\
+\midrule
+SUM(c0) & NSM & 15.8 & early & 14.8 & auto & 14.8 & 1.07$\times$ & 1.07$\times$ \\
+SUM(c0) & DSM & 1.0 & early & 1.0 & auto & 1.0 & 1.03$\times$ & 1.03$\times$ \\
+SUM(c0) & PAX & 4.5 & late & 1.2 & auto & 1.2 & 3.79$\times$ & 3.79$\times$ \\
+SUM(c0..c15) & NSM & 24.2 & early & 22.2 & early & 23.1 & 1.09$\times$ & 1.05$\times$ \\
+SUM(c0..c15) & DSM & 23.5 & early & 17.9 & early & 18.4 & 1.31$\times$ & 1.28$\times$ \\
+SUM(c0..c15) & PAX & 19.0 & late & 16.8 & auto & 16.8 & 1.13$\times$ & 1.13$\times$ \\
+SELECT * & NSM & 61.2 & late & 36.9 & auto & 36.9 & 1.66$\times$ & 1.66$\times$ \\
+SELECT * & DSM & 79.6 & early & 34.6 & early & 35.6 & 2.30$\times$ & 2.23$\times$ \\
+SELECT * & PAX & 80.6 & early & 31.7 & auto & 31.7 & 2.54$\times$ & 2.54$\times$ \\
+SELECT c0..c3, 1\% & NSM & 15.7 & late & 14.6 & late & 20.7 & 1.08$\times$ & 0.76$\times$ \\
+SELECT c0..c3, 1\% & DSM & 3.4 & late & 2.5 & late & 2.7 & 1.37$\times$ & 1.27$\times$ \\
+SELECT c0..c3, 1\% & PAX & 9.1 & late & 3.1 & auto & 3.1 & 2.91$\times$ & 2.91$\times$ \\
+SELECT *, 10\% & NSM & 23.1 & early-pipe & 24.4 & auto & 24.4 & 0.95$\times$ & 0.95$\times$ \\
+SELECT *, 10\% & DSM & 27.4 & late & 22.7 & early & 23.4 & 1.21$\times$ & 1.17$\times$ \\
+SELECT *, 10\% & PAX & 23.8 & late & 23.6 & late & 23.7 & 1.01$\times$ & 1.01$\times$ \\
+SELECT *, 50\% & NSM & 44.5 & early & 31.5 & early & 32.0 & 1.41$\times$ & 1.39$\times$ \\
+SELECT *, 50\% & DSM & 54.4 & early-pipe & 29.9 & early & 29.9 & 1.82$\times$ & 1.82$\times$ \\
+SELECT *, 50\% & PAX & 52.9 & late & 29.5 & auto & 29.5 & 1.80$\times$ & 1.80$\times$ \\
+\bottomrule
+\end{tabular}

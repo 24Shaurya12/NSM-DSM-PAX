@@ -1,0 +1,40 @@
+% Ideas we implemented and measured, and why they were not kept (or kept only in part).
+
+\begin{description}
+\item[Measuring both strategies instead of a threshold.] With \code{--auto-measure}, auto times
+every span of at least 1024 rows with \code{rdtsc}, keeps a moving average of each strategy's
+cycles per row for each power-of-two range of selectivity, and runs the cheaper one, re-running
+the other now and then (once every $32\times$ its cost ratio spans) to refresh its estimate. Two
+details were needed. About one span in 250 is interrupted and takes 3--30 times its cost, so
+samples are clipped at twice the running estimate; without that, one spike made auto pick the
+wrong strategy for hundreds of spans. And deciding per 128-row PAX page cost about a cycle per
+row. It works: from DRAM it stays within 5\% of the better fixed strategy (geometric mean),
+and in L3 its worst point is 1.16$\times$ (\cref{tab:autocache}). We did not keep it as the
+rule, because it costs 2--5\% where the threshold is already right (the timing and the
+exploration), 5--15\% in cache, where a span of early SUM takes only about 1{,}200 cycles, and
+a threshold that knows where the data lives gets most of its benefit for free. It remains as an
+option, and the tuned run of \cref{tab:tuned} used it.
+\item[One gather pass for all columns.] Late makes one pass over the selection vector per
+output attribute. A variant that makes one pass and writes all $k$ attributes of each selected
+row (more independent misses per row, output written in order) took 0.97--1.11 times as long
+below 5\%: the per-attribute loop already keeps many misses in flight, since each address comes
+from the cached selection vector. Above 7\% it was 10--30\% faster, but there late already loses,
+and it moved the $k{=}16$ crossover only from about 7\% to 8--9\%. The expensive part is the
+touched line, not how the loop is organised.
+\item[Vectors sized to L1.] Our first rule kept a vector's data in half of the L1D. It cut L1D
+misses but not time, and made decoding 1.2$\times$ slower (\cref{sec:tuning:batch}).
+\item[Padding PAX minipages by 64 bytes.] Meant to break the L1 aliasing of large pages, it
+changed nothing: with the page size fixed, padding lowers the tuples per page and the stride
+stays $P/16$. An odd number of lines per minipage is what works (\cref{sec:tuning:place}).
+\item[A stage copied with \code{memcpy}.] Up to 36\% slower than writing directly. Only the
+streaming copy makes the stage worthwhile (\cref{sec:tuning:output}).
+\item[SUM over dictionary codes by counting.] Counting each code's occurrences and multiplying
+by the dictionary once was 10--25\% slower than one lookup per row, with 32-bit counters and
+with 16-bit L1-resident ones: a counter update is a load, an add and a store, and rows with the
+same code wait for each other through memory. dictb's SUM without a predicate stays at 9.3\ms,
+against 8.2\ms{} for plain.
+\item[Skipping empty code groups in dictb.] A branch that skips 32-code groups without a match
+is predictable only while matches are rare. At 1\% selectivity 27\% of the groups hold one, and
+the branch doubled the scan time. dictb skips empty groups only when the previous vector's
+selectivity was below 0.2\%, and is branch-free otherwise.
+\end{description}

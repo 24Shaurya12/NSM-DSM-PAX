@@ -1,0 +1,239 @@
+% Tuning: one machine parameter -> one code choice, and the result of all of them together.
+
+The analysis tied each effect to one parameter of this machine. This section turns each
+parameter into a rule that \code{scan\_bench} applies when the corresponding knob is set, and
+measures what it buys (\cref{tab:tuning}). The rules are computed at start-up from sysfs, so
+nothing in the code is specific to this laptop; the constants of the materialization threshold
+(\cref{sec:mat}) were fitted on it.
+
+\begin{table*}[t]
+\centering\small
+\caption{Machine parameters and the choices derived from them.}
+\label{tab:tuning}
+\begin{tabularx}{\textwidth}{>{\raggedright}p{3.3cm}>{\raggedright}p{2.5cm}Xp{3.7cm}}
+\toprule
+Parameter (this machine) & Decides & Rule & Measured effect \\
+\midrule
+Line size (64\,B), value width; where the table lives & early or late, per span &
+late while $f(s) < \varphi(1-\sigma/g)$, with constants for DRAM and for tables that fit in L3
+(\cref{sec:mat:auto}) & within 1\% of the better fixed strategy on DSM from DRAM; \code{SELECT *}
+in L3 worst case 2.6$\times$ $\to$ 1.3$\times$ \\
+Cache sizes vs work per value & vector size & fit the vector's buffers in L2 ($\frac14$) for
+our scans; smaller for random access inside a vector, larger for a high fixed cost per vector &
+decoding SUM 1.2$\times$ faster than an L1-sized vector (\cref{sec:tuning:batch}) \\
+L1 set stride (4\,KB), 64 sets, 8 ways & DSM column starts, PAX minipage stride & column $c$
+starts $17c$ lines into its page; minipages hold an odd number of lines & early \code{SELECT *}
+at 1\%: 2.7$\times$ on DSM, 2.3--2.7$\times$ on PAX (\cref{sec:tuning:place}) \\
+Write-allocate (12\,GB/s, 40 with NT stores) & how output is written & build each vector's
+tuples in a cache-resident stage, copy it out with streaming stores & projections of every row
+1.2--1.9$\times$ faster (\cref{sec:tuning:output}) \\
+Prefetcher (stops at 4\,KB pages); dTLB reach (8\,MB) & PAX page size; OS page size & 256\,KB
+PAX pages; 2\,MB pages for buffers of 2\,MB or more & PAX SUM(c0) 4.5 $\to$ 1.2\ms; late SUM
+20\% faster (\cref{sec:tuning:pages}) \\
+AVX2 (no compress, no AVX-512); DRAM at 7\,B/cycle & selection and decoding kernels; code width
+& hand-written SIMD selection vector and fused unpack-and-add; dictionary codes of 1, 2 or 4
+bytes & late SUM wins in cache; bit-packed SUM 1.6$\times$ faster than plain; dictionary
+predicate 2.2--5.4$\times$ (\cref{sec:mat:cache,sec:enc}) \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\subsection{Vector size: match it to the work, not to one cache level}
+\label{sec:tuning:batch}
+
+\begin{table}[t]
+\centering\small
+\caption{ns per value for three synthetic workloads and our decoding scan, with the vector's
+buffers sized to fit L1, L2 or L3 (\code{build/batchbench}, \code{results/batch\_demo/}). Best
+per row in bold.}
+\label{tab:batchwork}
+\begin{tabular}{lrrr}
+\toprule
+Workload & fits L1 & fits L2 & fits L3 \\
+\midrule
+random reads inside the vector & \textbf{1.34} & 1.69 & 2.55 \\
+random reads + 2\,\textmu s per vector & 2.40 & \textbf{1.90} & 2.60 \\
+light work + 20\,\textmu s per vector & 12.05 & 2.26 & \textbf{1.69} \\
+our scan (decode 8 bit-packed columns + SUM) & 0.37 & \textbf{0.31} & 0.32 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The engine processes one vector of $B$ rows at a time, and the vector's buffers (selection
+vector, decoded values, output tile) live in L1, L2 or L3 depending on $B$. Two costs pull in
+opposite directions: the work per value, which is cheaper when the buffers sit in a faster
+level, and the fixed cost per vector (a decode call per column, loop setup, a prefetcher
+restart, or in other systems a call into another runtime or a hand-off to another thread),
+which a larger vector amortises. \Cref{tab:batchwork} shows that either can win.
+\begin{itemize}
+\item \textbf{Random reads inside the vector} (like probing a per-vector table) want L1: L1
+answers in about 4 cycles, L2 in 12.
+\item \textbf{The same with 2\,\textmu s per vector} wants L2: an L1-sized vector pays the fixed
+cost too often.
+\item \textbf{Light work with 20\,\textmu s per vector} wants L3 or more: the fixed cost
+dominates until the vector is megabytes large.
+\item \textbf{Our scans} read their buffers sequentially, and an L2 hit streams at 130\,GB/s,
+nearly L1's 122, so L1-sized vectors cut L1D misses but not time. Late \code{SELECT *} at
+100\% with 128-row vectors keeps its output tile in L1 and cuts misses from 19 to 5 per row,
+at the same latency. But small vectors slow decoding (one call per column per vector):
+bit-packed SUM takes 11.9\ms{} with the 128 rows an L1-sized rule gives, and 9.9\ms{} with
+1024. Beyond the L2 the buffers spill and both slow down again.
+\end{itemize}
+So \code{--batch auto} sizes the vector so that every byte it touches per row fits in a quarter
+of L2, $B = \max\{2^i : 2^i \cdot b_\text{row} \le L2/4\}$, leaving room for lines in flight and
+prefetched lines. On this machine that is 256 rows for \code{SELECT *} of 16 attributes, 1024
+for 4, and 1024 for decoding 8 bit-packed columns. A workload with random accesses inside the
+vector, or a large fixed cost per vector, would need the rule moved to L1 or to L3.
+
+\subsection{Placing columns and minipages in the cache sets}
+\label{sec:tuning:place}
+
+\begin{table}[t]
+\centering\small
+\caption{Early \code{SELECT *} at 1\% on PAX, plain minipages vs an odd number of lines per
+minipage (\code{--pax-pad auto}); L1D misses per row in brackets.}
+\label{tab:aliasing}
+\begin{tabular}{lrr}
+\toprule
+Page size (minipage stride) & plain & odd-line minipages \\
+\midrule
+32\,KB (2\,KB: 8 per set, fits) & 37.8\ms & not needed \\
+64\,KB (4\,KB) & 65.6\ms{} (8.6) & 27.8\ms{} (3.3) \\
+256\,KB & 63.0\ms & 24.2\ms \\
+4\,MB & 62.7\ms & 23.3\ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Streams read in lockstep must not share an L1 set (\cref{sec:analysis:cache}). Two rules
+follow from the 64 sets and the 4\,KB set stride.
+\begin{itemize}
+\item \textbf{DSM} (\code{--dsm-offset auto}): column $c$ starts $17c$ lines into its
+page-aligned allocation. 17 is coprime to the 64 L1 sets and the 1024 L2 sets, so up to 64
+columns fall into distinct L1 sets. Early \code{SELECT *} at 1\% drops from 62.6 to 22.9\ms.
+\item \textbf{PAX} (\code{--pax-pad auto}): from 64\,KB pages up, the 16 minipages start $P/16$
+apart, a multiple of 4\,KB, so value $r$ of all of them maps to one set. Shortening each
+minipage to an odd number of lines (64 $\to$ 63 at 64\,KB) puts them in 16 different sets, at a
+cost of one line per minipage (1.6\%). Early \code{SELECT *} at 1\% becomes 2.3--2.7$\times$
+faster, within 7\% of DSM from 256\,KB pages (\cref{tab:aliasing}). Padding by 64 bytes does
+not help: with the page size fixed, the stride stays $P/16$.
+\end{itemize}
+The effect is largest where reading dominates. Early is the only strategy that reads the 16
+streams at once (late reads one at a time and is unaffected), and at 1\% almost nothing is
+written. At 100\%, where writing the output dominates, the misses still halve but the time
+improves only 1.1$\times$ (90.8 to 81.9\ms{} at 64\,KB), and SUM of 16 attributes, which is
+bound by DRAM bandwidth, also gains only 1.1$\times$ (20.0 to 18.4\ms).
+
+We found the effect by accident. DSM columns first came from \code{malloc}, and depending on
+the allocator's state they were either carved back to back out of the heap (which happened to
+spread them over 16 sets) or given one page-aligned \code{mmap} each. The same \code{SELECT *}
+took 21\ms{} in one experiment and 64\ms{} in another. The engine now gives large buffers
+their own \code{mmap} and staggers DSM columns explicitly.
+
+\subsection{Writing the output}
+\label{sec:tuning:output}
+
+\begin{table}[t]
+\centering\small
+\caption{Three ways to write a projection's output.}
+\label{tab:stage}
+\begin{tabular}{lcc}
+\toprule
+Approach & absorbs scattered writes? & avoids the read before write? \\
+\midrule
+normal stores & yes (the cache does) & no, paid per line \\
+streaming stores directly & no (partial lines) & yes \\
+stage (normal stores) + streaming copy & yes & yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{Projections of every row (ms) with direct writes, a stage copied with \code{memcpy}, and
+a stage copied with streaming (NT) stores.}
+\label{tab:outputknobs}
+\resizebox{\linewidth}{!}{\gen{output_knobs}}
+\end{table}
+
+A projection of every row writes as many bytes as it reads, and from DRAM those writes cost
+more: a normal store that misses reads the line first, so writes reach 12\,GB/s while reads
+reach 28. Streaming (non-temporal) stores skip that read: they fill a 64-byte write-combining
+buffer in the core and send the whole line to memory, at 40\,GB/s. But only whole lines written
+in order benefit, and our writes are scattered: early writes each row's slot and overwrites it
+when the row fails, late writes a vector's output one attribute at a time. So
+\code{--nt-stores} lets each vector write its tuples with normal stores into a small stage that
+stays in cache, and copies the stage out with 32-byte streaming stores (\cref{tab:stage}).
+\begin{itemize}
+\item At 100\% this makes every configuration 1.2--1.9$\times$ faster
+(\cref{tab:outputknobs}): DSM early 71.2 to 37.9\ms, NSM early 67.1 to 41.5\ms, and PAX late,
+whose column-at-a-time writes were the most scattered, 86.5 to 45.3\ms. The line model predicts
+it: 512\,MB read at 28\,GB/s and written at 40\,GB/s take 31\ms{} if nothing overlaps, against
+61\ms{} with write-allocate.
+\item The stage alone (\code{memcpy}) is up to 36\% slower than writing directly: it adds a
+copy and still pays for write-allocate. The gain comes from the streaming stores.
+\item At 1\% there is almost nothing to write, and the three modes are within noise.
+\end{itemize}
+Streaming stores bypass the cache, so they suit a result written once and read later. A result
+consumed right away by the next operator should stay in cache.
+
+\subsection{Pages: the prefetcher and the TLB}
+\label{sec:tuning:pages}
+
+\paragraph{PAX page size.} Every PAX minipage is a new stream that the prefetcher has to find
+(\cref{sec:analysis:cache}), about 120\,ns per page at 16\,KB. Larger pages make the minipages
+longer: SUM(c0) takes 4.9\ms{} at 16\,KB, 2.8 at 64\,KB and 1.2 at 4\,MB, the same as DSM. The
+tuned configuration uses 256\,KB pages with odd-line minipages, where late \code{SELECT *}
+reaches DSM late and early comes within 7\% of DSM early.
+
+\paragraph{Huge pages.} The 2048-entry L2 dTLB covers 8\,MB with 4\,KB pages, so a 32\,MB column
+needs 8192 translations, and 16 with 2\,MB pages. With \code{--hugepages}, buffers of 2\,MB or
+more are allocated 2\,MB-aligned and marked \code{MADV\_HUGEPAGE} before they are first touched
+(WSL2's kernel backs only such marked regions with huge pages). For SUM of 16 DSM columns, dTLB
+misses fall from 0.031 to 0.008 per row for both strategies, but only late gets faster: 23.3 to
+18.7\ms{} (20\%), against 19.3 to 18.8\ms{} (3\%) for early. Early's 16 interleaved columns keep
+other loads going while one of them waits for a page walk; late works through one column at a
+time, so its single stream stalls on every walk. Staggering helps early, huge pages help late.
+
+\subsection{Everything together}
+\label{sec:tuning:all}
+
+\begin{figure}[t]
+\centering
+\fig{tuned}
+\caption{Six queries with the untuned defaults (light) and with every machine-derived knob
+(dark), best strategy of each, 4M rows from DRAM.}
+\label{fig:tuned}
+\end{figure}
+
+\begin{table*}[t]
+\centering\small
+\caption{Untuned against tuned, in ms. Untuned: 1024-row vectors, page-aligned DSM columns,
+4\,KB pages, direct output writes, scalar kernels, 16\,KB PAX pages, and the best of the four
+fixed strategies. Tuned: \code{--batch auto --dsm-offset auto --hugepages --nt-stores --simd},
+256\,KB PAX pages with \code{--pax-pad auto}, and auto (in this run measuring both strategies,
+\cref{sec:tried}). Speedups are over the untuned best.}
+\label{tab:tuned}
+\gen{tuned}
+\end{table*}
+
+\Cref{fig:tuned,tab:tuned} put the knobs together on six queries and three layouts, from DRAM.
+The untuned engine is given the best of the four fixed strategies per cell, which a real engine
+cannot know in advance; the tuned one has to pick its strategy with auto.
+\begin{itemize}
+\item \textbf{Over the 18 cells the tuned engine is 1.46$\times$ faster} (geometric mean;
+1.50$\times$ with the best tuned strategy): 1.11$\times$ on NSM, 1.41$\times$ on DSM and
+1.96$\times$ on PAX, up to 3.8$\times$ for PAX SUM(c0) (4.5 to 1.2\ms).
+\item \textbf{Projections of many rows gain on every layout}: \code{SELECT *} of every row
+1.7$\times$ on NSM, 2.3$\times$ on DSM and 2.5$\times$ on PAX, mostly from the streaming stores.
+After tuning NSM no longer wins it: 36.9\ms, against 34.6 on DSM and 31.7 on PAX.
+\item \textbf{PAX gains the most}, because two of its defaults are wrong for memory: 16\,KB pages
+are too short for the prefetcher, and larger pages alias in L1 without the odd-line stride.
+\item \textbf{Queries that already move few lines gain little}: DSM SUM(c0) is one sequential
+stream (1.03$\times$).
+\item \textbf{Exceptions.} NSM \code{SELECT *} at 10\% (0.95$\times$): its best untuned
+strategy, early-pipe, is not in the tuned set. PAX at 10\% is unchanged. One cell, NSM
+\code{SELECT c0..c3} at 1\% with auto (0.76$\times$), hit a slow period on the host; repeated
+three times, auto takes 15.2--16.1\ms{} against late's 14.5--15.4, and the 1.46$\times$ includes
+the bad measurement.
+\end{itemize}

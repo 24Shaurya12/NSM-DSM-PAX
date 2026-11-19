@@ -1,0 +1,13 @@
+taskset -c 2 /home/shaurya/repos/COL868/build/scan_bench --rows 1048576 --cols 8 --domain 100 --iters 5 --rounds 3 --warmup 1 --dsm-offset auto --layout dsm --encoding bitpack,for,dict,dictb --mode vector --query sum --k 8 --strategy early,late --min-time-ms 20 --simd --output /home/shaurya/repos/COL868/results/enc_workingset/encws_65536k_simd.csv.tmp
+CPU: AMD Ryzen 5 5600H with Radeon Graphics
+  L1D: 32 KB, 8-way, 64 B lines, 64 sets (same-set stride 4 KB)
+  L2: 512 KB, 8-way, 64 B lines, 1024 sets (same-set stride 64 KB)
+  L3: 16 MB, 16-way, 64 B lines, 16384 sets (same-set stride 1 MB)
+  page size 4 KB, transparent huge pages: madvise
+Table: 1048576 rows x 8 cols, 64 MB of data, uniform distribution, DSM column offset step 1088 B
+  DSM footprint: 64 MB
+  DSM-bitpack-vector footprint: 7.00034 MB
+  DSM-for-vector footprint: 7.16431 MB
+  DSM-dict-vector footprint: 7.00638 MB
+  DSM-dictb-vector footprint: 8.0061 MB
+Correctness check passed for 1 configurations

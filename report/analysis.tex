@@ -1,0 +1,126 @@
+% Analysis: why the layout results look the way they do.
+
+\subsection{The cache-line count}
+\label{sec:analysis:lines}
+
+Almost every result in \cref{sec:results} follows from one quantity: the number of cache lines
+a query moves per table row, from the level of the hierarchy the table lives in.
+\Cref{tab:linemodel} lists it for 8-byte values in 64-byte lines ($v = 8$ values per line), $N$
+attributes, $k$ read and selectivity $s$. The central term is
+\[
+  f(s) = 1 - (1-s)^{v},
+\]
+the fraction of a column's lines that hold at least one selected value: a line is skipped
+only if all $v$ of its values fail. A late strategy cannot avoid those lines, even though it
+wants one value from each.
+
+\begin{table}[t]
+\centering\small
+\caption{Cache lines moved per table row ($v{=}8$). The predicate is on one of the $k$
+attributes. Output lines are written; without streaming stores each one is also read first.}
+\label{tab:linemodel}
+\begin{tabular}{lll}
+\toprule
+ & input lines per row & output lines per row (projection) \\
+\midrule
+NSM, any strategy & $\lceil N/8 \rceil$ (whole rows; 2 for $N{=}16$) & $s\,k/8$ \\
+DSM / PAX, early & $k/8$ & $s\,k/8$ \\
+DSM / PAX, late & $1/8 + (k-1)/8 \cdot f(s)$ & $s\,k/8$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\fig{selectivity_lines}
+\caption{Measured L1D misses per row (markers) vs the input-line model of
+\cref{tab:linemodel} (grey) for \code{SELECT * WHERE c0 < x}, from DRAM.}
+\label{fig:sellines}
+\end{figure}
+
+\paragraph{The model against the counters.} \Cref{fig:sellines} compares measured L1D misses
+per row with the model for \code{SELECT *} on DSM and PAX. Early misses 2.2 times per row
+against a predicted 2. Late follows $1/8 + 15/8\,f(s)$ up to about 2\% (0.128 measured vs
+0.127 predicted at 0.01\%, 0.32 vs 0.27 at 1\%); above that, the misses of its output tile
+take over (\cref{sec:analysis:recon}).
+
+\paragraph{Lines predict time.} From DRAM a streamed line costs about $64\,\text{B} /
+28\,\text{GB/s} \approx 2.3$\,ns, and a written line about $64/12 \approx 5.3$\,ns because of the
+read for ownership.
+\begin{itemize}
+\item NSM \code{SELECT *} at $k{=}N{=}16$: the model gives $4\mathrm{M} \cdot (2 \cdot 2.3 + 2
+\cdot 5.3)\,\text{ns} = 61$\ms; we measured 61.2\ms.
+\item SUM: NSM moves 2 lines per row at every $k$ (13--22\ms), DSM $k/8$ (about $1.0 \cdot
+k$\ms). Hence the 15$\times$ at $k{=}1$, close to the 16$\times$ ratio of lines.
+\item The projectivity crossover is where DSM's $k/8$ input lines plus its reconstruction
+overhead exceed NSM's 2: between $k{=}8$ and 16.
+\item In cache, lines are cheap (\cref{tab:machine}), so the same counts predict much smaller
+differences: the NSM/DSM ratio for SUM(c0) shrinks from 15$\times$ in DRAM to 5$\times$ in L2.
+What is left is CPU work.
+\end{itemize}
+By the input lines alone, late should beat early at every $s < 1$, since
+$1/8 + (k-1)/8\,f(s) < k/8$. It does not, and \cref{sec:mat} measures the two costs the count
+leaves out.
+
+\subsection{When the CPU, not memory, is the limit}
+\label{sec:analysis:cpu}
+
+At 4.1\,GHz DRAM delivers about 7 bytes per cycle and L2 about 31. A loop that spends more
+cycles per byte than that is CPU-bound, and its layout matters less than its instruction
+count. Three cases showed up in the counters: generic tuple-at-a-time code (54 instructions
+per row before the kernels were specialised, \cref{sec:design:exec}); early on 16 attributes,
+which copies all 16 values of every row (54 instructions and 22 cycles per row on DSM, so its
+21\ms{} in \cref{fig:selectivity} is partly CPU time, not only the 18\ms{} it takes to stream
+512\,MB); and everything in cache, where summing 16 attributes takes 1.1\,ns per row on DSM
+and 2.5\,ns on NSM, both far from the L2's bandwidth.
+
+\subsection{Cache behaviour beyond line counts}
+\label{sec:analysis:cache}
+
+Four effects change the cost of a line without changing how many are moved. Each is tied to
+one parameter of this machine, and \cref{sec:tuning} turns each into a fix.
+\begin{description}
+\item[Short streams and the prefetcher.] The hardware prefetcher detects a stream after a few
+misses and does not follow it across a 4\,KB page. A DSM column is one long stream; a PAX
+minipage of a 16\,KB page is a stream of 16 lines, followed by a jump of 15\,KB to the next
+page's minipage. That is the 120\,ns per page of SUM(c0) on PAX (\cref{sec:res:pax}): each
+minipage starts with a trip to DRAM. Early reads all 16 minipages of a page row by row, 16
+short streams at once, and pays about 1\,\textmu s more per page than DSM (\code{SELECT *} at
+1\%: 53.8 vs 22.7\ms). Late reads one minipage at a time and pays less. The smallest pages
+avoid the problem differently: a 1\,KB page has 16 one-line minipages, so reading it row by row
+is one sequential stream through the table, and its cost becomes per-page CPU work instead.
+\item[Set conflicts (L1: 64 sets $\times$ 8 ways, stride 4\,KB).] Addresses 4\,KB apart share an
+L1 set. Page-aligned DSM columns, and PAX minipages from 64\,KB pages up (stride $P/16$, a
+multiple of 4\,KB), put value $r$ of all 16 attributes in one 8-way set. Reading them in
+lockstep, as early does, evicts lines that are still needed: 8.6 L1D misses per row instead of
+about 3, and early \code{SELECT *} at 1\% nearly three times slower (\cref{sec:tuning:place}).
+\item[TLB reach.] With 4\,KB pages, the 2048-entry L2 dTLB covers 8\,MB, a quarter of one 32\,MB column.
+A scan of 16 columns misses it 0.063 times per row, and late, which works through one column at
+a time, cannot overlap the page walks with other loads (\cref{sec:tuning:pages}).
+\item[Write-allocate.] A store that misses reads the line before overwriting it, so output
+lines cost about twice the DRAM traffic of input lines (12 vs 28\,GB/s). Streaming stores avoid
+the read, but only for whole lines written in order (\cref{sec:tuning:output}).
+\end{description}
+
+\subsection{Tuple reconstruction}
+\label{sec:analysis:recon}
+
+To build an output tuple of $k$ attributes, DSM and PAX gather from $k$ places, while NSM copies
+one contiguous range. This costs in three ways.
+\begin{enumerate}
+\item \textbf{Streams.} Early reads $k$ input streams and writes one output stream at once.
+Beyond about 16 streams the L1's 8 ways and the prefetcher's stream table run out, which is
+why DSM's \code{SELECT *} grows with the width while NSM's does not (\cref{sec:res:width}).
+\item \textbf{The output tile.} Late writes a vector's output one attribute at a time, so each
+output line is touched $v$ times and the tile of $B \cdot k \cdot 8$ bytes must stay cached
+between touches. With $B{=}1024$ and $k{=}16$ it is 128\,KB: too big for L1 (19 misses per
+row), small enough for L2. With $B{=}65536$ it is 8\,MB, spills L2, and the time nearly
+doubles.
+\item \textbf{Instructions.} A gather is a load of the position, a load of the value and a
+strided store, about 7 instructions per value against about 3 for early. This is why late is
+slower than early at 100\% even when the bytes moved are the same (99 vs 68\ms{} on DSM).
+\end{enumerate}
+NSM pays none of these: its reconstruction is a copy. It still loses at low projectivity and
+selectivity, because it reads every row's lines. Hence the classic split: DSM (late) wins when
+few attributes or few rows are wanted, NSM wins \code{SELECT *} over many rows, and PAX tracks
+DSM only once its pages are large and its minipages do not alias.

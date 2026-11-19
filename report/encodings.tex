@@ -1,0 +1,151 @@
+% Encodings: decoding first loses, computing on compressed data wins, and the decode budget.
+
+\begin{table}[t]
+\centering\small
+\caption{Compression ratio (uncompressed bytes / encoded bytes) per data set.}
+\label{tab:encratio}
+\gen{encodings_ratio}
+\end{table}
+
+Each data set has one encoding it is meant for (\cref{tab:encratio}): uniform values in
+$[0,100)$ for bitpack, for and dict (7 bits, 9.1$\times$; dictb's 1-byte codes 8.0$\times$);
+sorted values for delta (15.6$\times$) and for (5.3$\times$); runs of mean length 64 for rle
+(32$\times$); Zipf values from 10{,}000 distinct ones for dict (4.5$\times$, dictb 4.0$\times$);
+and \emph{wide} 64-bit values, where nothing compresses. The table has $N{=}8$ attributes and
+4M rows, from DRAM.
+
+\subsection{Decoding first never pays off}
+\label{sec:enc:decode}
+
+\begin{table*}[t]
+\centering\small
+\caption{Speedup over plain DSM, best strategy, scalar / AVX2 kernels. Above 1 the encoding is
+faster than the uncompressed column.}
+\label{tab:encspeed}
+\resizebox{\textwidth}{!}{\gen{encodings_speedup}}
+\end{table*}
+
+The early strategy decodes every vector and then runs the plain kernel. With scalar code it is
+slower than plain DSM for every encoding, whatever the compression: SUM of all 8 attributes
+runs at 0.80$\times$ for bitpack (9.1$\times$ smaller), 0.69$\times$ for rle (32$\times$
+smaller), 0.30$\times$ for delta (15.6$\times$) and 0.30$\times$ for dict. The speed does not
+follow the compression ratio, because the scan is no longer limited by bytes but by the
+instructions that decode them. Value mode, one virtual call per value, is 5--11$\times$ slower
+than plain for every encoding, plain included.
+
+\subsection{Computing on the compressed form}
+\label{sec:enc:compressed}
+
+\begin{table}[t]
+\centering\small
+\caption{Decoding first vs working on the compressed form (ms, AVX2 kernels). SUM rows: all 8
+attributes, on the encoding's own data set. Zone maps and dict: SUM(c0) with a predicate at
+0.1--1\%.}
+\label{tab:encdecode}
+\begin{tabular}{llrrr}
+\toprule
+Encoding & Operation on the compressed form & decode first & compressed & plain \\
+\midrule
+rle & $\sum$ value $\times$ run length & 11.5 & \textbf{0.10} & 8.4 \\
+delta & $m f + \sum_k d_k (m-k)$ per block & 24.5 & \textbf{6.4} & 8.0 \\
+bitpack & $m \cdot \min + \sum$ offsets & 7.7 & \textbf{4.9} & 7.9 \\
+for & zone maps skip blocks (sorted) & 4.0 & \textbf{0.09--0.36} & 1.3--1.4 \\
+dict & compare 14-bit codes (unpacked first) & 2.6 & 1.63 & \textbf{1.28} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Without a predicate, late SUM on an encoded column calls one aggregate that works on the
+compressed data, so the work scales with the compressed size, not the number of values
+(\cref{tab:encdecode}).
+\begin{itemize}
+\item \textbf{rle} adds value $\times$ run length once per run: 0.10\ms, 87$\times$ faster than
+plain DSM. The first version took 1.9\ms, because a binary search for the first run of every
+1024-row vector took 60\% of the time (each vector covers only about 16 runs). Remembering the
+run the previous vector ended in, one call per column when there is no predicate, and a loop
+over whole runs that gcc vectorizes brought it to 0.10\ms. The 7.6\,MB of runs then stay in L3
+between repetitions, which is part of the 87$\times$.
+\item \textbf{delta} sums each block from its deltas, $m f + \sum_k d_k(m-k)$, without the
+prefix sum that rebuilds the values. The prefix sum is a dependency chain through every value
+(3--4 cycles per value); the formula has none, and the AVX2 kernel computes it with two
+running sums per lane: 6.0--6.4\ms, 1.25--1.31$\times$ faster than plain.
+\item \textbf{Predicates on packed data.} bitpack and for compare packed offsets against a
+translated bound and extract the other attributes only at selected positions. With 10-bit
+values a line holds 51 of them, so late gathers 6.4 times fewer lines, and late SUM on bitpack
+beats every uncompressed plan up to 5\% (2.4\ms{} at 1\% against 2.7 for late and 3.6--3.9 for
+early on plain DSM). The same packing lowers the crossover within one encoding, 5--10\% for
+SUM on bitpack and for against 17--21\% for the uncompressed column, because $f(s)$ is already
+0.40 at 1\% (\cref{sec:mat:threshold}).
+\item \textbf{Zone maps.} On sorted data, for skips every block whose minimum and maximum
+exclude the predicate and accepts every block they include: 0.09--0.36\ms{} at 0.1--1\%,
+against 1.3--1.4\ms{} for late on plain DSM and 4.0\ms{} for decoding first.
+\end{itemize}
+
+\subsection{Dictionary codes that fit a SIMD lane}
+\label{sec:enc:dictb}
+
+\begin{table*}[t]
+\centering\small
+\caption{\code{SUM WHERE c0 < x} on Zipf data in ms: plain DSM, dict (14-bit packed codes) and
+dictb (2-byte codes), best of early and late, AVX2. The selectivities are those the Zipf data
+allows.}
+\label{tab:encdict}
+\gen{enc_dict}
+\end{table*}
+
+dict is the exception in \cref{tab:encdecode}: working on its codes still loses (1.63 vs
+1.28\ms{} at 1\%), because each code is stored in exactly $\lceil\log_2 |D|\rceil = 14$ bits and
+has to be unpacked into a 32-bit lane before the cheap comparison. dictb rounds the code width
+up to 1, 2 or 4 bytes, a lane width AVX2 compares directly. A predicate is then one
+subtraction, one unsigned minimum and one comparison per 16 two-byte codes read straight from
+memory, and \code{movemask} gives one bit per code. It costs 12\% of the compression
+(4.5$\times$ to 4.0$\times$) and turns the dictionary predicate from a loss into a win
+(\cref{tab:encdict}): 0.57\ms{} at 1\%, 2.2$\times$ faster than plain and 2.9$\times$ faster
+than dict, and 5.4$\times$ faster than plain at 0.05\%. The gain shrinks as more is gathered
+(0.9$\times$ at 41\%, where every selected row still needs a lookup), and scalar code gets
+nothing from the byte layout (1.9\ms{} at every selectivity).
+
+\subsection{When decoding must happen: a budget per value}
+\label{sec:enc:budget}
+
+\begin{table}[t]
+\centering\small
+\caption{SUM of 8 attributes on uniform data, cycles per value, by where the uncompressed table
+would live. Packed: bitpack and for with the AVX2 fused unpack-and-add.}
+\label{tab:budget}
+\begin{tabular}{lrrr}
+\toprule
+Table in & Plain & Packed (AVX2) & Packed vs plain \\
+\midrule
+L2 / L3 & 0.26--0.30 & 0.61--0.68 & 0.40--0.49$\times$ \\
+16\,MB (spilling L3) & 0.46 & 0.61--0.68 & 0.72--0.76$\times$ \\
+DRAM & 0.90--0.98 & 0.61--0.68 & \textbf{1.42--1.60$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Where the values must be decoded, decoding and loading overlap, so the time per value is
+\[
+  t = \max(\text{compute},\ \text{load}),\qquad
+  \text{packed wins when}\ \max(\text{decode}+\text{add},\ \text{load}_\text{packed})
+  < \max(\text{add},\ \text{load}_\text{plain}).
+\]
+From DRAM the packed load is small (9$\times$ less data), so packed wins when decoding plus
+adding costs less than loading a plain value: about 1 cycle per 8-byte value at 28\,GB/s. In
+cache the plain load is cheap and the budget shrinks to 0.26--0.30 cycles. The measurements
+follow it (\cref{tab:budget}).
+\begin{itemize}
+\item \textbf{Scalar unpacking} of 7-bit values costs 1.2--1.3 cycles per value, just over the
+DRAM budget: bitpack moves 9.1$\times$ fewer bytes and is still 0.8$\times$ as fast as plain.
+\item \textbf{AVX2 unpacking with a fused sum} costs 0.61--0.68 cycles per value at every size.
+In the format we use, 8 consecutive $w$-bit values occupy exactly $w$ bytes; for $w \le 25$,
+one byte shuffle places each value's bytes in its own 32-bit lane and a per-lane variable
+shift (\code{vpsrlvd}, AVX2 only) and a mask extract it, and the offsets are added without
+being stored. From DRAM that is within the budget, and bitpack and for become
+1.56--1.60$\times$ faster than plain on uniform data; in cache it is twice the plain cost.
+\item \textbf{Dictionary decoding} adds a dependent lookup per value (2--4 cycles), over the
+budget even with SIMD unpacking. A dictionary pays off for predicates, not for decoding.
+\end{itemize}
+So on this machine compression is a way to make a DRAM-bound scan CPU-bound, and it pays off
+only from DRAM and only with SIMD decoding: the deciding size is the L3 capacity, measured on
+the uncompressed table.
